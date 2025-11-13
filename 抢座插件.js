@@ -1,0 +1,1147 @@
+// ==UserScript==
+// @name         QIshan今天抢到座位了吗 - V1.3.4 (最终稳定版)
+// @namespace    http://tampermonkey.net/
+// @version      1.3.4
+// @description  为吉林大学图书馆座位预约系统 (libseat.jlu.edu.cn) 创建的 Tampermonkey 用户脚本。修复楼层映射、日期逻辑和定时启动错误，优化UI联动和健壮性。提供浮动 UI 选择楼层、地段、自定义预约日期、开始/结束时间、优先座位号，定时抢座开关和信息，新增自动跳转楼层页面功能。
+// @author       Qishan
+// @match        https://libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2*
+// @grant        GM_log
+// @grant        GM.info
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_openInTab
+// @run-at       document-start
+// @license      MIT
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const TARGET_COMPONENT_NAME = "SeatChooseV2";
+    let vm = null;
+    let 抢座核心逻辑Timer = null;
+    let vmDiscoveryInterval = null;
+    let uiInitialized = false;
+
+    // --- 默认配置 (用户可修改，或通过 UI 保存) ---
+    const defaultConfig = {
+        // --- 抢座时间控制 ---
+        autoStartAtSpecificTime: true,
+        startHour: 21,
+        startMinute: 0,
+        startSecond: 1,
+
+        // --- 预约日期与时间范围 ---
+        targetDate: "",
+        targetStartTime: "08:00",
+        targetEndTime: "22:00",
+
+        // --- 座位筛选偏好 ---
+        seatPreferences: {
+            "3F": [
+                { type: "靠边", rule: "剩余的", priority: 1 },
+                { type: "大理石", rule: "29-59", priority: 2 },
+                { type: "中间", rule: "61+3n, n<12", priority: 3 }
+            ],
+            "2F": [
+                { type: "靠边", rule: "37-84", priority: 1 },
+                { type: "大理石", rule: "85-102", priority: 2 },
+                { type: "中间", rule: "2+3n, n<12", priority: 3 }
+            ]
+        },
+        globalBlacklistKeywords: ["设备损坏", "禁"],
+
+        // --- 自动化程度 ---
+        autoReserve: true,
+        autoConfirmReservation: true,
+
+        // --- 性能与重试 ---
+        retryInterval: 50,
+        randomizeDelay: 20,
+        maxRetriesForSeatFetch: 200,
+
+        // --- 内部延迟 (一般无需修改) ---
+        modalButtonFindDelay: 100,
+        postClickDelay: 300,
+
+        // --- 楼层与页面映射--
+        floorPageMap: {
+            "3F": "https://libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2?id=1", // Corrected ID
+            "2F": "https://libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2?id=2"  // Corrected ID
+        },
+
+        // --- UI 相关配置 (GM_setValue 保存) ---
+        uiSelectedFloor: "3F",
+        uiSelectedPreference: "auto",
+        uiPreferredSeatNumber: "",
+        uiPanelMinimized: false
+    };
+
+    let config = { ...defaultConfig };
+
+    const GM_CONFIG_KEY = 'libseat_auto_reserve_config_v1_3_4'; // 更新配置键
+
+    // --- 日志函数 ---
+    function log(...args) { GM_log(`[${GM.info.script.name}]`, ...args); }
+    function error(...args) { console.error(`[${GM.info.script.name} ERROR]`, ...args); GM_log(`[${GM.info.script.name} ERROR]`, ...args); }
+
+    // --- 工具函数 ---
+    function parseSeatNumberFromName(seatName) {
+        if (!seatName) return NaN;
+        const matches = seatName.match(/\d+/g);
+        if (matches && matches.length > 0) {
+            return parseInt(matches[matches.length - 1], 10);
+        }
+        return NaN;
+    }
+
+    function matchesPreferenceRule(ruleString, seatNumber) {
+        if (!ruleString || isNaN(seatNumber)) return false;
+
+        const patternMatch = ruleString.match(/(\d+)\+(\d+)n,\s*n<(\d+)/);
+        if (patternMatch) {
+            const A = parseInt(patternMatch[1], 10);
+            const B = parseInt(patternMatch[2], 10);
+            const M = parseInt(patternMatch[3], 10);
+            for (let n = 0; n < M; n++) {
+                if (seatNumber === A + B * n) return true;
+            }
+            return false;
+        }
+
+        const rangeMatch = ruleString.match(/(\d+)-(\d+)/);
+        if (rangeMatch) {
+            const start = parseInt(rangeMatch[1], 10);
+            const end = parseInt(rangeMatch[2], 10);
+            return seatNumber >= start && seatNumber <= end;
+        }
+        return false;
+    }
+
+    function getFloorIdentifier(readingRoom) {
+        if (!readingRoom) {
+            log('getFloorIdentifier: vm.readingRoom is null or undefined.');
+            return null;
+        }
+
+        if (readingRoom.parentNamePath) {
+            const match = readingRoom.parentNamePath.match(/(\d+F)/);
+            if (match) {
+                log(`getFloorIdentifier: Found floor '${match[1]}' from parentNamePath.`);
+                return match[1];
+            }
+        }
+
+        if (readingRoom.name) {
+            const match = readingRoom.name.match(/(\d+F)/);
+            if (match) {
+                log(`getFloorIdentifier: Found floor '${match[1]}' from name.`);
+                return match[1];
+            }
+        }
+
+        if (readingRoom.id) {
+            for (const floorId in config.floorPageMap) {
+                const url = config.floorPageMap[floorId];
+                const urlMatch = url.match(/id=(\d+)/);
+                if (urlMatch && parseInt(urlMatch[1], 10) === readingRoom.id) {
+                    log(`getFloorIdentifier: Found floor '${floorId}' by matching readingRoom.id with floorPageMap.`);
+                    return floorId;
+                }
+            }
+        }
+
+        log('getFloorIdentifier: Could not find floor identifier from vm.readingRoom.');
+        return null;
+    }
+
+    function getCurrentFormattedDate() {
+        const today = new Date();
+        const yyyy = today.getFullYear();
+        const mm = String(today.getMonth() + 1).padStart(2, '0');
+        const dd = String(today.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+    }
+
+    function getTomorrowFormattedDate() {
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const yyyy = tomorrow.getFullYear();
+        const mm = String(tomorrow.getMonth() + 1).padStart(2, '0');
+        const dd = String(tomorrow.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+    }
+
+    async function loadConfig() {
+        try {
+            const storedConfig = await GM_getValue(GM_CONFIG_KEY, null);
+            if (storedConfig) {
+                if (storedConfig.seatPreferences) {
+                    storedConfig.seatPreferences = { ...defaultConfig.seatPreferences, ...storedConfig.seatPreferences };
+                }
+                if (storedConfig.floorPageMap) {
+                    storedConfig.floorPageMap = { ...defaultConfig.floorPageMap, ...storedConfig.floorPageMap };
+                }
+                config = { ...defaultConfig, ...storedConfig };
+                log("Loaded configuration from storage:", config);
+            } else {
+                log("No stored configuration found, using default config.");
+            }
+        } catch (e) {
+            error("Failed to load configuration from storage:", e);
+            config = { ...defaultConfig };
+        }
+    }
+
+    async function saveConfig() {
+        try {
+            const configToSave = {
+                autoStartAtSpecificTime: config.autoStartAtSpecificTime,
+                startHour: config.startHour,
+                startMinute: config.startMinute,
+                startSecond: config.startSecond,
+                targetDate: config.targetDate,
+                targetStartTime: config.targetStartTime,
+                targetEndTime: config.targetEndTime,
+                globalBlacklistKeywords: config.globalBlacklistKeywords,
+                autoReserve: config.autoReserve,
+                autoConfirmReservation: config.autoConfirmReservation,
+                retryInterval: config.retryInterval,
+                randomizeDelay: config.randomizeDelay,
+                maxRetriesForSeatFetch: config.maxRetriesForSeatFetch,
+                modalButtonFindDelay: config.modalButtonFindDelay,
+                postClickDelay: config.postClickDelay,
+                uiSelectedFloor: config.uiSelectedFloor,
+                uiSelectedPreference: config.uiSelectedPreference,
+                uiPreferredSeatNumber: config.uiPreferredSeatNumber,
+                uiPanelMinimized: config.uiPanelMinimized
+            };
+            await GM_setValue(GM_CONFIG_KEY, configToSave);
+            log("Configuration saved to storage.");
+        } catch (e) {
+            error("Failed to save configuration to storage:", e);
+        }
+    }
+
+    // --- Vue 实例查找 ---
+    async function waitForUniAppPageVm() {
+        log('Attempting to find UniApp Vue instance...');
+        return new Promise((resolve) => {
+            let retryCount = 0;
+            const maxRetriesForVm = 60;
+
+            vmDiscoveryInterval = setInterval(() => {
+                retryCount++;
+                if (retryCount > maxRetriesForVm) {
+                    clearInterval(vmDiscoveryInterval);
+                    error('Max retries reached for finding root Vue instance. Script cannot proceed.');
+                    resolve(null);
+                    return;
+                }
+
+                let rootVm = null;
+                if (typeof getCurrentPages === 'function') {
+                    const pages = getCurrentPages();
+                    if (pages && pages.length > 0) {
+                        const currentPage = pages[pages.length - 1];
+                        if (currentPage && currentPage.$vm) {
+                            rootVm = currentPage.$vm;
+                        } else if (currentPage && currentPage.vm) {
+                            rootVm = currentPage.vm;
+                        }
+                    }
+                }
+
+                if (rootVm) {
+                    const rootVmName = rootVm.$options.name || rootVm.$options._componentTag || 'N/A';
+                    if (rootVmName === TARGET_COMPONENT_NAME) {
+                        clearInterval(vmDiscoveryInterval);
+                        log(`Successfully found target component (it is the root VM itself): "${TARGET_COMPONENT_NAME}".`);
+                        resolve(rootVm);
+                    } else {
+                        const foundVm = findVueInstance(rootVm, TARGET_COMPONENT_NAME);
+                        if (foundVm) {
+                            clearInterval(vmDiscoveryInterval);
+                            log('Successfully found SeatChooseV2 VM.');
+                            resolve(foundVm);
+                        }
+                    }
+                }
+            }, 500);
+        });
+    }
+
+    // --- 核心抢座逻辑 ---
+    async function setTimeRange(vmInstance, date, startTime, endTime) {
+        log(`Setting time range to: Date=${date}, Start=${startTime}, End=${endTime}`);
+        if (vmInstance.timeRange) {
+            vmInstance.timeRange.date = date;
+            vmInstance.timeRange.startTime = startTime;
+            vmInstance.timeRange.endTime = endTime;
+            if (typeof vmInstance.$set === 'function') {
+                vmInstance.$set(vmInstance, 'timeRange', { ...vmInstance.timeRange, date, startTime, endTime });
+            } else {
+                vmInstance.timeRange = { ...vmInstance.timeRange, date, startTime, endTime };
+            }
+            log('timeRange updated in VM. Expecting seat list to refresh.');
+        } else {
+            error('vmInstance.timeRange is not available. Cannot set time range.');
+        }
+    }
+
+    async function selectAndReserveSeat(vmInstance, seat) {
+        if (!seat || !seat.id) {
+            error('Invalid seat object provided for selection.');
+            return false;
+        }
+        log(`Attempting to select seat: ${seat.name} (ID: ${seat.id})`);
+        const seatIndex = vmInstance.seatList.findIndex(s => s.id === seat.id);
+        if (seatIndex === -1) {
+            error(`Seat ${seat.name} (ID: ${seat.id}) not found in current seatList. Cannot select.`);
+            return false;
+        }
+
+        try {
+            await vmInstance.selectSeat({ seat: seat, index: seatIndex });
+            log(`Seat ${seat.name} selected. Waiting for reservation modal to appear.`);
+            let modalVisibleCheckRetries = 0;
+            const maxModalVisibleChecks = 10;
+            while (!vmInstance.seatReserveVisible && modalVisibleCheckRetries < maxModalVisibleChecks) {
+                await new Promise(r => setTimeout(r, 500));
+                modalVisibleCheckRetries++;
+            }
+
+            if (vmInstance.seatReserveVisible) {
+                log('Reservation modal is visible.');
+                if (config.autoConfirmReservation) {
+                    log('Auto-confirm is ON. Attempting to click the "预约" button...');
+                    await new Promise(r => setTimeout(r, config.modalButtonFindDelay));
+                    const confirmButton = document.querySelector('.seat-btn.seat-btn-primary');
+                    if (confirmButton) {
+                        confirmButton.click();
+                        log('Clicked the "预约" button.');
+                        await new Promise(r => setTimeout(r, config.postClickDelay));
+                        return true;
+                    } else {
+                        error('Could not find the "预约" button in the reservation modal.');
+                        return false;
+                    }
+                } else {
+                    log('Auto-confirm is OFF. Please manually confirm the reservation in the modal.');
+                    return true;
+                }
+            } else {
+                error('Reservation modal did not become visible after selecting seat within timeout.');
+                return false;
+            }
+        } catch (e) {
+            error('Error during selectSeat or auto-confirmation:', e);
+            return false;
+        }
+    }
+
+    async function startReservationProcess(manualTrigger = false) {
+        log(`Starting reservation process (Manual: ${manualTrigger})...`);
+        if (vmDiscoveryInterval) {
+            clearInterval(vmDiscoveryInterval);
+        }
+
+        if (!vm) {
+            vm = await waitForUniAppPageVm();
+            if (!vm) {
+                updateUIStatus('错误: 无法找到 UniApp Vue 实例。');
+                error('Failed to find UniApp Vue instance. Script cannot proceed.');
+                return;
+            }
+            updateUIStatus('UniApp Vue 实例已找到。');
+        }
+
+        updateUIStatus('正在初始化预约。');
+
+        const uiTargetDate = document.getElementById('res-date-input').value;
+        const uiStartTime = document.getElementById('res-start-time').value;
+        const uiEndTime = document.getElementById('res-end-time').value;
+
+        if (!uiTargetDate || !/^\d{4}-\d{2}-\d{2}$/.test(uiTargetDate)) {
+            updateUIStatus('错误: 预约日期格式无效 (YYYY-MM-DD)。');
+            error('Invalid reservation date format.');
+            return;
+        }
+        if (!uiStartTime || !/^\d{2}:\d{2}$/.test(uiStartTime) || !uiEndTime || !/^\d{2}:\d{2}$/.test(uiEndTime)) {
+            updateUIStatus('错误: 预约开始时间或结束时间无效。');
+            error('Invalid reservation start or end time.');
+            return;
+        }
+
+        const reservationDate = uiTargetDate;
+        log(`预约日期: ${reservationDate}`);
+
+        const startMoment = new Date(`${reservationDate} ${uiStartTime}`);
+        const endMoment = new Date(`${reservationDate} ${uiEndTime}`);
+        if (endMoment.getTime() <= startMoment.getTime()) {
+             endMoment.setDate(endMoment.getDate() + 1);
+             if (endMoment.getTime() <= startMoment.getTime()) {
+                 updateUIStatus('错误: 预约结束时间必须晚于开始时间。');
+                 error('Reservation end time must be after start time.');
+                 return;
+             }
+        }
+
+        setTimeRange(vm, reservationDate, uiStartTime, uiEndTime);
+        updateUIStatus(`已设置时间范围: ${reservationDate} ${uiStartTime} - ${uiEndTime}`);
+
+        // --- 楼层页面跳转逻辑 ---
+        const uiSelectedFloor = document.getElementById('floor-select').value;
+        let currentFloorIdForLogic = uiSelectedFloor;
+        let actualDetectedFloor = getFloorIdentifier(vm.readingRoom);
+
+        // 如果UI选择的是“自动检测”
+        if (currentFloorIdForLogic === 'auto') {
+            if (actualDetectedFloor) { // 如果成功检测到实际楼层
+                currentFloorIdForLogic = actualDetectedFloor;
+                log(`UI楼层设置为自动检测，实际检测到楼层为: ${actualDetectedFloor}`);
+                // 更新UI下拉框以反映实际检测到的楼层
+                const floorSelect = document.getElementById('floor-select');
+                if (floorSelect && floorSelect.value !== currentFloorIdForLogic) {
+                    floorSelect.value = currentFloorIdForLogic;
+                    config.uiSelectedFloor = currentFloorIdForLogic;
+                    saveConfig();
+                }
+            } else { // 如果自动检测失败
+                currentFloorIdForLogic = defaultConfig.uiSelectedFloor; // 回退到默认楼层 (3F)
+                updateUIStatus(`警告: 无法自动检测楼层，已回退到默认楼层: ${currentFloorIdForLogic}。`);
+                log(`Warning: Auto-detection of floor failed, reverting to default: ${currentFloorIdForLogic}.`);
+                // 更新UI下拉框，让用户知道回退了
+                const floorSelect = document.getElementById('floor-select');
+                if (floorSelect) {
+                    floorSelect.value = currentFloorIdForLogic;
+                    config.uiSelectedFloor = currentFloorIdForLogic;
+                    saveConfig();
+                }
+            }
+        }
+        // 至此，currentFloorIdForLogic 包含了用户UI选择的楼层或有效的自动检测/回退楼层
+
+        const targetFloorUrl = config.floorPageMap[currentFloorIdForLogic];
+        const currentUrl = window.location.href.split('?')[0];
+        const targetUrlBase = targetFloorUrl ? targetFloorUrl.split('?')[0] : null;
+
+        // 如果UI中设置的（或自动检测/回退到的）楼层有对应的URL，并且当前页面的URL主体不匹配
+        if (targetFloorUrl && currentUrl !== targetUrlBase) {
+            updateUIStatus(`当前页面楼层与设置不符 (${currentFloorIdForLogic})。正在跳转到目标楼层页面...`);
+            log(`Redirecting to floor page for ${currentFloorIdForLogic}: ${targetFloorUrl}`);
+            window.location.replace(targetFloorUrl);
+
+            if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
+            抢座核心逻辑Timer = null;
+            return;
+        } else if (!targetFloorUrl) { // 如果UI选择的楼层没有配置URL
+            updateUIStatus(`警告: 楼层 ${currentFloorIdForLogic} 没有配置跳转URL，请在脚本中检查 floorPageMap。`);
+            error(`Warning: Floor ${currentFloorIdForLogic} has no URL configured in floorPageMap.`);
+        }
+
+
+        let retries = 0;
+        const fetchSeatsLoop = async () => {
+            if (抢座核心逻辑Timer === null && !manualTrigger) return;
+
+            if (retries >= config.maxRetriesForSeatFetch) {
+                updateUIStatus('错误: 达到最大重试次数，未找到可用座位。');
+                error('Max retries reached for fetching seats. Failed to get available seats. Stopping.');
+                if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
+                抢座核心逻辑Timer = null;
+                return;
+            }
+
+            retries++;
+            const currentRetryInterval = config.retryInterval + Math.floor(Math.random() * config.randomizeDelay);
+            updateUIStatus(`正在获取座位 (尝试 ${retries}/${config.maxRetriesForSeatFetch})，延迟 ${currentRetryInterval}ms...`);
+
+            try {
+                await vm.getSeats();
+
+                let availableSeatsCount = 0;
+                let categorizedSeats = [];
+
+                if (vm.seatList && vm.seatList.length > 0) {
+                    categorizedSeats = vm.seatList.filter(seat =>
+                        seat.type === 'SEAT' &&
+                        seat.enabled &&
+                        seat.status === 'FREE' &&
+                        !config.globalBlacklistKeywords.some(keyword => seat.name.includes(keyword))
+                    ).map(seat => {
+                        const parsedSeatNumber = parseSeatNumberFromName(seat.name);
+                        return {
+                            ...seat,
+                            parsedSeatNumber: parsedSeatNumber,
+                            category: "未分类",
+                            categoryPriority: Infinity
+                        };
+                    }).filter(seat => !isNaN(seat.parsedSeatNumber));
+                    availableSeatsCount = categorizedSeats.length;
+                }
+
+                updateUIStatus(`座位刷新成功。目前可选座位数: ${availableSeatsCount}`);
+
+                if (availableSeatsCount === 0) {
+                    抢座核心逻辑Timer = setTimeout(fetchSeatsLoop, currentRetryInterval);
+                    return;
+                }
+
+                // --- 智能座位筛选和排序 ---
+                const uiSelectedPreference = document.getElementById('preference-select').value;
+                const uiPreferredSeatNumber = parseInt(document.getElementById('preferred-seat-number').value, 10);
+
+                // 实际用于排序的楼层ID应该基于页面实际识别到的，因为跳转后页面的vm.readingRoom才是真实的
+                const actualFloorIdForSorting = getFloorIdentifier(vm.readingRoom) || defaultConfig.uiSelectedFloor;
+                const floorPreferences = config.seatPreferences[actualFloorIdForSorting];
+
+
+                if (!floorPreferences) {
+                    updateUIStatus(`错误: 未找到当前页面楼层 (${actualFloorIdForSorting || '未知'}) 的偏好配置。`);
+                    error(`No seat preferences defined for floor ${actualFloorIdForSorting || 'unknown'}.`);
+                    if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
+                    抢座核心逻辑Timer = null;
+                    return;
+                }
+
+                if (floorPreferences && floorPreferences.length > 0) {
+                    for (const seat of categorizedSeats) {
+                        let matchedRule = false;
+                        for (const pref of floorPreferences) {
+                            if (pref.rule === "剩余的" && uiSelectedPreference !== "auto" && uiSelectedPreference !== "剩余的") continue;
+
+                            if (pref.rule !== "剩余的" && matchesPreferenceRule(pref.rule, seat.parsedSeatNumber)) {
+                                if (uiSelectedPreference === "auto" || uiSelectedPreference === pref.type) {
+                                    seat.category = pref.type;
+                                    seat.categoryPriority = pref.priority;
+                                    matchedRule = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!matchedRule) {
+                            const remainingPref = floorPreferences.find(p => p.rule === "剩余的");
+                            if (remainingPref && (uiSelectedPreference === "auto" || uiSelectedPreference === "剩余的")) {
+                                seat.category = remainingPref.type;
+                                seat.categoryPriority = remainingPref.priority;
+                            }
+                        }
+                    }
+                }
+
+                let finalTargetSeat = null;
+
+                if (!isNaN(uiPreferredSeatNumber) && uiPreferredSeatNumber > 0) {
+                    const preferredSeatFromList = categorizedSeats.find(s => s.parsedSeatNumber === uiPreferredSeatNumber);
+                    if (preferredSeatFromList) {
+                        finalTargetSeat = preferredSeatFromList;
+                        updateUIStatus(`找到用户指定优先座位: ${finalTargetSeat.name}`);
+                    } else {
+                        updateUIStatus(`用户指定优先座位 ${uiPreferredSeatNumber} 不可用或不存在，将按偏好选择。`);
+                    }
+                }
+
+                if (!finalTargetSeat) {
+                     categorizedSeats.sort((a, b) => {
+                        if (a.categoryPriority !== b.categoryPriority) {
+                            return a.categoryPriority - b.categoryPriority;
+                        }
+                        return a.parsedSeatNumber - b.parsedSeatNumber;
+                    });
+                    finalTargetSeat = categorizedSeats[0];
+                }
+
+                if (!finalTargetSeat) {
+                    updateUIStatus('未找到符合条件的座位。');
+                    抢座核心逻辑Timer = setTimeout(fetchSeatsLoop, currentRetryInterval);
+                    return;
+                }
+
+                updateUIStatus(`找到可用座位 (偏好: ${finalTargetSeat.category || 'N/A'}): ${finalTargetSeat.name} (ID: ${finalTargetSeat.id}, 号码: ${finalTargetSeat.parsedSeatNumber})`);
+
+                if (config.autoReserve) {
+                    updateUIStatus('自动预订已开启。尝试预约座位。');
+                    const success = await selectAndReserveSeat(vm, finalTargetSeat);
+                    if (success) {
+                        updateUIStatus('座位预约流程已启动。请检查控制台确认状态。');
+                        if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
+                        抢座核心逻辑Timer = null;
+                        return;
+                    } else {
+                        updateUIStatus('错误: 预约失败。正在重试...');
+                        抢座核心逻辑Timer = setTimeout(fetchSeatsLoop, currentRetryInterval);
+                    }
+                } else {
+                    updateUIStatus(`自动预订已关闭。找到座位 (ID: ${finalTargetSeat.id}, 名称: ${finalTargetSeat.name})。请手动预约。`);
+                    if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
+                    抢座核心逻辑Timer = null;
+                    return;
+                }
+
+            } catch (e) {
+                updateUIStatus('错误: 获取座位失败。正在重试...');
+                error('Error fetching seats:', e);
+                抢座核心逻辑Timer = setTimeout(fetchSeatsLoop, currentRetryInterval);
+            }
+        };
+
+        if (manualTrigger) {
+            fetchSeatsLoop();
+        } else {
+            抢座核心逻辑Timer = setTimeout(fetchSeatsLoop, 200);
+        }
+    }
+
+    // --- UI 相关函数 ---
+    // scheduleAutoStart 函数定义前移，解决 ReferenceError
+    function scheduleAutoStart() {
+        const statusDiv = document.getElementById('status');
+        if (!statusDiv) return;
+
+        if (!config.autoStartAtSpecificTime) {
+            statusDiv.textContent = '准备就绪。定时抢座功能已关闭。';
+            if (抢座核心逻辑Timer) { // 如果定时关闭，确保清除任何待处理的定时器
+                clearTimeout(抢座核心逻辑Timer);
+                抢座核心逻辑Timer = null;
+            }
+            return;
+        }
+
+        const now = new Date();
+        let scriptWakeUpTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+                                             config.startHour, config.startMinute, config.startSecond, 0);
+
+        let delay = scriptWakeUpTime.getTime() - now.getTime();
+
+        if (delay < 0) {
+            scriptWakeUpTime.setDate(scriptWakeUpTime.getDate() + 1);
+            delay = scriptWakeUpTime.getTime() - now.getTime();
+            while (delay < 0 && scriptWakeUpTime.getTime() < now.getTime() + 7 * 24 * 60 * 60 * 1000) {
+                scriptWakeUpTime.setDate(scriptWakeUpTime.getDate() + 1);
+                delay = scriptWakeUpTime.getTime() - now.getTime();
+            }
+        }
+
+        if (delay > 0) {
+            const timeString = scriptWakeUpTime.toLocaleTimeString();
+            updateUIStatus(`等待 ${delay / 1000} 秒，将于 ${timeString} 自动开始抢座...`);
+            if (抢座核心逻辑Timer) {
+                clearTimeout(抢座核心逻辑Timer);
+            }
+            抢座核心逻辑Timer = setTimeout(startReservationProcess, delay);
+        } else {
+            updateUIStatus('定时启动时间已过，将立即执行抢座。');
+            startReservationProcess();
+        }
+    }
+
+    function createUI() {
+        const uiContainer = document.createElement('div');
+        uiContainer.id = 'libseat-auto-reserve-ui';
+        uiContainer.style = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 340px;
+            background-color: #fff;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            z-index: 99999;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+            color: #333;
+            font-size: 14px;
+            display: flex;
+            flex-direction: column;
+            resize: both;
+            overflow: auto;
+        `;
+
+        uiContainer.innerHTML = `
+            <style>
+                #libseat-auto-reserve-ui * { box-sizing: border-box; }
+                #libseat-auto-reserve-ui .header {
+                    background-color: #65cafd;
+                    color: white;
+                    padding: 8px 12px;
+                    border-top-left-radius: 8px;
+                    border-top-right-radius: 8px;
+                    cursor: grab;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    font-weight: bold;
+                    user-select: none;
+                }
+                #libseat-auto-reserve-ui .header.dragging { cursor: grabbing; }
+                #libseat-auto-reserve-ui .header button {
+                    background: none;
+                    border: none;
+                    color: white;
+                    font-size: 18px;
+                    cursor: pointer;
+                    padding: 0 5px;
+                }
+                #libseat-auto-reserve-ui .content {
+                    padding: 12px;
+                    display: ${config.uiPanelMinimized ? 'none' : 'block'};
+                }
+                #libseat-auto-reserve-ui .form-group {
+                    margin-bottom: 10px;
+                }
+                /* New styles for inline layout */
+                #libseat-auto-reserve-ui .form-group-row {
+                    display: flex;
+                    gap: 8px;
+                    margin-bottom: 10px;
+                }
+                #libseat-auto-reserve-ui .form-group-item {
+                    flex: 1;
+                }
+                #libseat-auto-reserve-ui .form-group-item label {
+                    display: block;
+                    margin-bottom: 4px;
+                    font-weight: bold;
+                }
+                /* End new styles */
+                #libseat-auto-reserve-ui label {
+                    display: block;
+                    margin-bottom: 4px;
+                    font-weight: bold;
+                }
+                #libseat-auto-reserve-ui select,
+                #libseat-auto-reserve-ui input[type="text"],
+                #libseat-auto-reserve-ui input[type="number"],
+                #libseat-auto-reserve-ui input[type="time"],
+                #libseat-auto-reserve-ui input[type="date"] {
+                    width: 100%;
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                #libseat-auto-reserve-ui .button-group {
+                    display: flex;
+                    gap: 8px;
+                    margin-top: 15px;
+                }
+                #libseat-auto-reserve-ui .button-group button {
+                    flex: 1;
+                    padding: 10px;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 14px;
+                    cursor: pointer;
+                    font-weight: bold;
+                }
+                #libseat-auto-reserve-ui #start-reserve-btn {
+                    background-color: #0ebf9d;
+                    color: white;
+                }
+                #libseat-auto-reserve-ui #reset-reserve-btn {
+                    background-color: #ffc107;
+                    color: black;
+                }
+                 #libseat-auto-reserve-ui #refresh-seats-btn {
+                    background-color: #ff9800;
+                    color: white;
+                }
+                #libseat-auto-reserve-ui #status {
+                    margin-top: 15px;
+                    padding: 10px;
+                    background-color: #f0f0f0;
+                    border-radius: 4px;
+                    min-height: 40px;
+                    overflow: auto;
+                }
+                /* New styles for checkbox and time inputs */
+                #libseat-auto-reserve-ui .checkbox-group {
+                    display: flex;
+                    align-items: center;
+                    margin-bottom: 10px;
+                }
+                #libseat-auto-reserve-ui .checkbox-group input[type="checkbox"] {
+                    margin-right: 8px;
+                    width: auto;
+                }
+            </style>
+            <div class="header">
+                <span>QIshan今天抢到座位了吗</span>
+                <div>
+                    <button id="minimize-btn">${config.uiPanelMinimized ? '+' : '-'}</button>
+                    <button id="close-btn">x</button>
+                </div>
+            </div>
+            <div class="content">
+                <div class="form-group-row">
+                    <div class="form-group-item">
+                        <label for="floor-select">当前楼层:</label>
+                        <select id="floor-select"></select>
+                    </div>
+                    <div class="form-group-item">
+                        <label for="preference-select">地段偏好:</label>
+                        <select id="preference-select"></select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="res-date-input">预约日期 (YYYY-MM-DD):</label>
+                    <input type="date" id="res-date-input">
+                </div>
+                <div class="form-group-row">
+                    <div class="form-group-item">
+                        <label for="res-start-time">开始时间:</label>
+                        <input type="time" id="res-start-time">
+                    </div>
+                    <div class="form-group-item">
+                        <label for="res-end-time">结束时间:</label>
+                        <input type="time" id="res-end-time">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="preferred-seat-number">优先座位号 (选填):</label>
+                    <input type="number" id="preferred-seat-number" placeholder="例如: 61">
+                </div>
+                <!-- 定时功能开关和信息 -->
+                <div class="checkbox-group">
+                    <input type="checkbox" id="auto-start-toggle" ${config.autoStartAtSpecificTime ? 'checked' : ''}>
+                    <label for="auto-start-toggle">定时自动抢座</label>
+                </div>
+                <div class="form-group-row">
+                    <div class="form-group-item">
+                        <label for="start-hour">时:</label>
+                        <input type="number" id="start-hour" min="0" max="23" value="${config.startHour}">
+                    </div>
+                    <div class="form-group-item">
+                        <label for="start-minute">分:</label>
+                        <input type="number" id="start-minute" min="0" max="59" value="${config.startMinute}">
+                    </div>
+                    <div class="form-group-item">
+                        <label for="start-second">秒:</label>
+                        <input type="number" id="start-second" min="0" max="59" value="${config.startSecond}">
+                    </div>
+                </div>
+                <div class="button-group">
+                    <button id="start-reserve-btn">立即开始抢座</button>
+                    <button id="refresh-seats-btn">刷新座位</button>
+                    <button id="reset-reserve-btn" style="display:none;">重置抢座</button>
+                </div>
+                <div class="form-group">
+                    <label>抢座状态:</label>
+                    <div id="status">准备就绪。</div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(uiContainer);
+        setupUIDragging(uiContainer);
+        setupUIEvents();
+        updateFloorAndPreferenceOptions();
+        applyStoredUIState();
+        uiInitialized = true;
+        scheduleAutoStart(); // UI 创建后直接调用 scheduleAutoStart
+    }
+
+    function setupUIDragging(uiContainer) {
+        const header = uiContainer.querySelector('.header');
+        let isDragging = false;
+        let offset = { x: 0, y: 0 };
+
+        header.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            header.classList.add('dragging');
+            offset = {
+                x: e.clientX - uiContainer.getBoundingClientRect().left,
+                y: e.clientY - uiContainer.getBoundingClientRect().top
+            };
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            uiContainer.style.left = `${e.clientX - offset.x}px`;
+            uiContainer.style.top = `${e.clientY - offset.y}px`;
+            uiContainer.style.right = 'auto';
+            uiContainer.style.bottom = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            header.classList.remove('dragging');
+        });
+    }
+
+    function setupUIEvents() {
+        const uiContainer = document.getElementById('libseat-auto-reserve-ui');
+        if (!uiContainer) return;
+
+        const floorSelect = document.getElementById('floor-select');
+        const preferenceSelect = document.getElementById('preference-select');
+        const resDateInput = document.getElementById('res-date-input');
+        const resStartTimeInput = document.getElementById('res-start-time');
+        const resEndTimeInput = document.getElementById('res-end-time');
+        const preferredSeatNumberInput = document.getElementById('preferred-seat-number');
+        const startBtn = document.getElementById('start-reserve-btn');
+        const resetBtn = document.getElementById('reset-reserve-btn');
+        const refreshBtn = document.getElementById('refresh-seats-btn');
+        const minimizeBtn = document.getElementById('minimize-btn');
+        const closeBtn = document.getElementById('close-btn');
+        const contentDiv = uiContainer.querySelector('.content');
+
+        const autoStartToggle = document.getElementById('auto-start-toggle');
+        const startHourInput = document.getElementById('start-hour');
+        const startMinuteInput = document.getElementById('start-minute');
+        const startSecondInput = document.getElementById('start-second');
+
+        // --- 事件监听器 ---
+        floorSelect.addEventListener('change', async () => {
+            config.uiSelectedFloor = floorSelect.value;
+            updateFloorAndPreferenceOptions(); // 重新加载地段偏好
+            await saveConfig();
+        });
+
+        preferenceSelect.addEventListener('change', async () => {
+            config.uiSelectedPreference = preferenceSelect.value;
+            await saveConfig();
+        });
+
+        resDateInput.addEventListener('change', async () => {
+            config.targetDate = resDateInput.value;
+            await saveConfig();
+        });
+
+        resStartTimeInput.addEventListener('change', async () => {
+            config.targetStartTime = resStartTimeInput.value;
+            await saveConfig();
+        });
+
+        resEndTimeInput.addEventListener('change', async () => {
+            config.targetEndTime = resEndTimeInput.value;
+            await saveConfig();
+        });
+
+        preferredSeatNumberInput.addEventListener('change', async () => {
+            config.uiPreferredSeatNumber = preferredSeatNumberInput.value;
+            await saveConfig();
+        });
+
+        autoStartToggle.addEventListener('change', async () => {
+            config.autoStartAtSpecificTime = autoStartToggle.checked;
+            await saveConfig();
+            scheduleAutoStart(); // 状态改变，重新安排定时
+        });
+        startHourInput.addEventListener('change', async () => {
+            config.startHour = parseInt(startHourInput.value, 10);
+            await saveConfig();
+            scheduleAutoStart(); // 时间改变，重新安排定时
+        });
+        startMinuteInput.addEventListener('change', async () => {
+            config.startMinute = parseInt(startMinuteInput.value, 10);
+            await saveConfig();
+            scheduleAutoStart(); // 时间改变，重新安排定时
+        });
+        startSecondInput.addEventListener('change', async () => {
+            config.startSecond = parseInt(startSecondInput.value, 10);
+            await saveConfig();
+            scheduleAutoStart(); // 时间改变，重新安排定时
+        });
+
+        startBtn.addEventListener('click', () => {
+            if (抢座核心逻辑Timer) {
+                clearTimeout(抢座核心逻辑Timer);
+                抢座核心逻辑Timer = null;
+            }
+            startReservationProcess(true); // 手动触发抢座
+            startBtn.style.display = 'none';
+            resetBtn.style.display = 'inline-block';
+        });
+
+        resetBtn.addEventListener('click', () => {
+            if (抢座核心逻辑Timer) {
+                clearTimeout(抢座核心逻辑Timer);
+                抢座核心逻辑Timer = null;
+            }
+            updateUIStatus('抢座已重置。');
+            startBtn.style.display = 'inline-block';
+            resetBtn.style.display = 'none';
+            if (config.autoStartAtSpecificTime) { // 如果定时启动是开启的，重新安排定时器
+                scheduleAutoStart();
+            }
+        });
+
+        refreshBtn.addEventListener('click', async () => {
+            if (!vm) {
+                updateUIStatus('错误: 无法找到 UniApp Vue 实例。请先启动抢座或等待页面加载。');
+                return;
+            }
+            updateUIStatus('正在手动刷新座位列表...');
+            try {
+                const manualDate = document.getElementById('res-date-input').value;
+                const manualStartTime = document.getElementById('res-start-time').value;
+                const manualEndTime = document.getElementById('res-end-time').value;
+
+                if (!manualDate || !/^\d{4}-\d{2}-\d{2}$/.test(manualDate) || !manualStartTime || !/^\d{2}:\d{2}$/.test(manualStartTime) || !manualEndTime || !/^\d{2}:\d{2}$/.test(manualEndTime)) {
+                     updateUIStatus('错误: 日期/时间输入无效，无法刷新座位。');
+                     return;
+                }
+
+                setTimeRange(vm, manualDate, manualStartTime, manualEndTime);
+
+                await vm.getSeats();
+
+                let availableSeatsCount = 0;
+                if (vm.seatList && vm.seatList.length > 0) {
+                    availableSeatsCount = vm.seatList.filter(seat =>
+                        seat.type === 'SEAT' &&
+                        seat.enabled &&
+                        seat.status === 'FREE' &&
+                        !config.globalBlacklistKeywords.some(keyword => seat.name.includes(keyword))
+                    ).length;
+                }
+                updateUIStatus(`座位刷新成功。目前可选座位数: ${availableSeatsCount}`);
+            } catch (e) {
+                error('手动刷新座位失败:', e);
+                updateUIStatus('错误: 手动刷新座位失败。');
+            }
+        });
+
+        minimizeBtn.addEventListener('click', async () => {
+            config.uiPanelMinimized = !config.uiPanelMinimized;
+            contentDiv.style.display = config.uiPanelMinimized ? 'none' : 'block';
+            minimizeBtn.textContent = config.uiPanelMinimized ? '+' : '-';
+            await saveConfig();
+        });
+
+        closeBtn.addEventListener('click', () => {
+            if (抢座核心逻辑Timer) {
+                clearTimeout(抢座核心逻辑Timer);
+                抢座核心逻辑Timer = null;
+            }
+            if (vmDiscoveryInterval) {
+                 clearInterval(vmDiscoveryInterval);
+            }
+            uiContainer.remove();
+            log('UI 面板已关闭。');
+        });
+
+        // 首次加载时设置 UI 控件的初始值
+        resDateInput.value = config.targetDate || getTomorrowFormattedDate();
+        resStartTimeInput.value = config.targetStartTime;
+        resEndTimeInput.value = config.targetEndTime;
+        preferredSeatNumberInput.value = config.uiPreferredSeatNumber;
+        startHourInput.value = config.startHour;
+        startMinuteInput.value = config.startMinute;
+        startSecondInput.value = config.startSecond;
+        autoStartToggle.checked = config.autoStartAtSpecificTime;
+    }
+
+    function updateFloorAndPreferenceOptions() {
+        const floorSelect = document.getElementById('floor-select');
+        const preferenceSelect = document.getElementById('preference-select');
+        if (!floorSelect || !preferenceSelect) return;
+
+        floorSelect.innerHTML = '';
+        preferenceSelect.innerHTML = '';
+
+        const autoFloorOption = document.createElement('option');
+        autoFloorOption.value = 'auto';
+        autoFloorOption.textContent = '自动检测楼层';
+        floorSelect.appendChild(autoFloorOption);
+
+        const availableFloors = Object.keys(config.seatPreferences);
+        availableFloors.forEach(floor => {
+            const option = document.createElement('option');
+            option.value = floor;
+            option.textContent = floor;
+            floorSelect.appendChild(option);
+        });
+
+        let currentDetectedFloor = vm ? getFloorIdentifier(vm.readingRoom) : null;
+
+        // 尝试从存储中加载、自动检测或使用默认值
+        if (config.uiSelectedFloor && (availableFloors.includes(config.uiSelectedFloor) || config.uiSelectedFloor === 'auto')) {
+            floorSelect.value = config.uiSelectedFloor;
+        } else if (currentDetectedFloor && availableFloors.includes(currentDetectedFloor)) {
+            floorSelect.value = currentDetectedFloor;
+            config.uiSelectedFloor = currentDetectedFloor;
+        } else {
+            // 默认楼层设置为 "3F"，如果 "3F" 在可用楼层中
+            if (availableFloors.includes("3F")) {
+                floorSelect.value = "3F";
+                config.uiSelectedFloor = "3F";
+            } else {
+                floorSelect.value = 'auto';
+                config.uiSelectedFloor = 'auto';
+            }
+        }
+        saveConfig();
+
+        const selectedFloor = floorSelect.value;
+        const currentFloorPreferences = config.seatPreferences[selectedFloor];
+
+        const autoPrefOption = document.createElement('option');
+        autoPrefOption.value = 'auto';
+        autoPrefOption.textContent = '按优先级选择（默认）';
+        preferenceSelect.appendChild(autoPrefOption);
+
+        if (currentFloorPreferences) {
+            currentFloorPreferences.forEach(pref => {
+                const option = document.createElement('option');
+                option.value = pref.type;
+                option.textContent = pref.type;
+                preferenceSelect.appendChild(option);
+            });
+        }
+
+        if (config.uiSelectedPreference &&
+            (preferenceSelect.querySelector(`option[value="${config.uiSelectedPreference}"]`) || config.uiSelectedPreference === 'auto')) {
+            preferenceSelect.value = config.uiSelectedPreference;
+        } else {
+            preferenceSelect.value = 'auto';
+            config.uiSelectedPreference = 'auto';
+        }
+        saveConfig();
+    }
+
+    function applyStoredUIState() {
+        const uiContainer = document.getElementById('libseat-auto-reserve-ui');
+        if (!uiContainer) return;
+        const contentDiv = uiContainer.querySelector('.content');
+        const minimizeBtn = document.getElementById('minimize-btn');
+
+        if (config.uiPanelMinimized) {
+            contentDiv.style.display = 'none';
+            minimizeBtn.textContent = '+';
+        } else {
+            contentDiv.style.display = 'block';
+            minimizeBtn.textContent = '-';
+        }
+    }
+
+    function updateUIStatus(message) {
+        const statusDiv = document.getElementById('status');
+        if (statusDiv) {
+            statusDiv.textContent = message;
+            statusDiv.scrollTop = statusDiv.scrollHeight;
+        }
+    }
+
+    // --- 主入口逻辑 ---
+    if (window.location.href.includes('libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2')) {
+        log('Script is running on the target page.');
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            await loadConfig();
+            createUI();
+            waitForUniAppPageVm().then(foundVm => {
+                vm = foundVm;
+                if (vm) {
+                    updateFloorAndPreferenceOptions();
+                    scheduleAutoStart(); // 在 UI 初始化和 VM 找到后，再安排定时启动
+                } else {
+                    updateUIStatus('错误: 无法找到 UniApp Vue 实例。');
+                }
+            });
+        });
+    } else {
+        log('Script not running on target page. Current URL:', window.location.href);
+    }
+})();
