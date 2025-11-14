@@ -1,0 +1,17 @@
+window.APP_CONFIG = {
+    baseUrl: 'https://libseat.jlu.edu.cn/v1',
+    portalUrl: 'http://202.198.25.137:10082/bAdmin/v1/',
+    mini: false,
+    reservationConfig: {
+        seat: true,
+        meeting: true,
+        longTerm: false
+    },
+    loginConfig: {
+        type: 'cas'
+    },
+    longTermConfig: {
+        next: false,
+        renewDebug: true
+    }
+}

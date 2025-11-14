@@ -1,0 +1,67 @@
+var urlInst = new URL(window.location.href);
+var searchParams = urlInst.searchParams, hash = urlInst.hash;
+function getHashSearchParam(key) {
+    if (!hash) {
+        return null;
+    }
+    try {
+        var r = hash.match(new RegExp(key + "=([^&]*)(&|$)"));
+        return r ? r[1] : null;
+    }
+    catch (err) {
+        return null;
+    }
+}
+function getSearchParam() {
+    var args = [];
+    for (var _i = 0; _i < arguments.length; _i++) {
+        args[_i] = arguments[_i];
+    }
+    return args.map(function (key) {
+        return searchParams.get(key) || getHashSearchParam(key);
+    });
+}
+function getCookie(name) {
+    var arr = document.cookie.match(new RegExp("(^| )" + name + "=([^;]*)(;|$)"));
+    if (arr != null)
+        return decodeURI(arr[2]);
+    return null;
+}
+/**
+ * 1. 有 query，证明为复制调试连接进入，更新 localstorage 中的参数，删除 cookie 中的 debug_exit
+ * 2. 没有 query，debug_exit 为 true，证明为点击退出调试，不进入调试模式
+ * 3. 没有 query，debug_exit 为 false，证明为刷新，如果 localstorage 有参数，进入调试模式
+ * 4. 没有 query，debug_exit 为 false，证明为刷新，如果 localstorage 没有参数，不进入调试模式
+ */
+var initDingH5RemoteDebug = function () {
+    var _a = getSearchParam('dd_debug_unifiedAppId', 'dd_debug_token', 'dd_debug_pid', 'dd_debug_uuid', 'dd_debug_v1', 'dd_debug_v2', 'dd_debug_os', 'dd_debug_h5'), unifiedAppId = _a[0], token = _a[1], pageId = _a[2], uuid = _a[3], v1 = _a[4], v2 = _a[5], os = _a[6], debug = _a[7];
+    var isDebugExit = getCookie('debug_exit');
+    var hrefHasQuery = debug && unifiedAppId;
+    var localHasQuery = localStorage.getItem('__dingtalk_dd_debug_obj');
+    // 2
+    if (isDebugExit && !hrefHasQuery) {
+        return;
+    }
+    if (hrefHasQuery) {
+        // 1
+        localStorage.setItem('__dingtalk_dd_debug_obj', JSON.stringify({
+            unifiedAppId: unifiedAppId,
+            token: token,
+            pageId: pageId,
+            uuid: uuid,
+            dingVersion: v1,
+            browserVersion: v2,
+            os: os,
+        }));
+        document.cookie = 'debug_exit=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+    }
+    else if (!localHasQuery) {
+        // 4
+        return;
+    }
+    var h5RemoteDebugSdkDom = document.createElement('script');
+    h5RemoteDebugSdkDom.type = 'text/javascript';
+    h5RemoteDebugSdkDom.src = "https://g.alicdn.com/code/npm/@ali/dingtalk-h5-remote-debug-sdk/0.1.8/app.bundle.js";
+    document.head.appendChild(h5RemoteDebugSdkDom);
+};
+initDingH5RemoteDebug();
