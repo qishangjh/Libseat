@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+echo "1. 测试连通性..."
+ping -c 4 github.com || echo "⚠ 网络延迟高/丢包"
+
+echo "2. 测试 SSH 22 端口..."
+timeout 5 ssh -T git@github.com 2>&1 | grep successfully && echo "✅ SSH 正常" || echo "❌ 22 端口被墙，准备改用 443"
+
+echo "3. 当前代理设置"
+git config --global --get http.proxy || echo "无代理"
+
+echo "4. 仓库体积"
+du -sh .git
+
+echo "5. 大文件列表"
+git lfs ls-files || echo "未启用 LFS"

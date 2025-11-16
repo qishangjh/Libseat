@@ -186,10 +186,10 @@ tags:
 
 ```javascript
 // ==UserScript==
-// @name         QIshan今天抢到座位了吗 - V1.4.4 (精准复合排序版)
-// @namespace    http://tampermonkey.net/
-// @version      1.4.4
-// @description  为吉林大学图书馆座位预约系统 (libseat.jlu.edu.cn) 创建的 Tampermonkey 用户脚本。精准实现复合优先级排序：喜欢座位号 > 地段偏好 (靠边/大理石/中间) > 距离目标座位。
+// @name         QIshan今天抢到座位了吗 - V1.6.0
+// @namespace    https://github.com/qishangjh/Libseat
+// @version      1.6.0
+// @description  为吉林大学图书馆座位预约系统 (libseat.jlu.edu.cn) 创建的 Tampermonkey 用户脚本。
 // @author       QIshan
 // @match        https://libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2*
 // @grant        GM_log
@@ -204,1799 +204,928 @@ tags:
 (function() {
     'use strict';
 
-    const TARGET_COMPONENT_NAME = "SeatChooseV2";
-    let vm = null;
-    let 抢座核心逻辑Timer = null;
-    let isReservationLoopActive = false; // 新增状态变量，标识抢座核心逻辑是否正在主动执行
-    let vmDiscoveryInterval = null;
-    let reservationAttempts = 0;
-    const MAX_RESERVATION_ATTEMPTS = 5;
-    const FETCH_SEAT_RETRY_DELAY = 1000;
-    const FETCH_SEAT_MAX_RETRIES = 3;
-    const seatCheckCache = new Map(); // 座位可用性检查缓存
+    // =================================================================================
+    // --- [模块] 工具函数 (Utils) ---
+    // =================================================================================
+    const Utils = {
+        ruleRegexCache: new Map(),
+        seatCheckCache: new Map(),
+        DISTANCE_SORT_TARGET_SEAT: 40,
+        TARGET_COMPONENT_NAME: "SeatChooseV2",
 
-    const DISTANCE_SORT_TARGET_SEAT = 40; // 距离排序的目标座位号
-
-    // --- 默认配置 ---
-    const defaultConfig = {
-        autoStartAtSpecificTime: true,
-        startHour: 21,
-        startMinute: 0,
-        startSecond: 1,
-        targetDate: "",
-        targetStartTime: "08:00",
-        targetEndTime: "22:00",
-        seatPreferences: {
-            "3F": [
-                { type: "靠边", rule: "剩余的", priority: 1 }, // 靠边 > 大理石 > 中间
-                { type: "大理石", rule: "29-59", priority: 2 },
-                { type: "中间", rule: "61+3n, n<12", priority: 3 }
-            ],
-            "2F": [
-                { type: "靠边", rule: "37-84", priority: 1 }, // 这里需要明确，如果靠边有具体规则，应写出来，否则会被视为通用规则
-                { type: "大理石", rule: "85-102", priority: 2 },
-                { type: "中间", rule: "2+3n, n<12", priority: 3 }
-            ]
+        async log(...args) {
+            console.log(`[${GM.info.script.name}]`, ...args);
+            try { await GM_log(`[${GM.info.script.name}]`, ...args); } catch (e) { /* silent */ }
         },
-        globalBlacklistKeywords: ["设备损坏", "禁"],
-        autoConfirmReservation: true,
-        retryInterval: 2000,
-        randomizeDelay: 500,
-        modalButtonFindDelay: 800,
-        postActionInitialWait: 100, // Initial brief wait after a click or VM action to allow synchronous UI updates
-        postActionMaxWait: 5000,    // Max total wait for reservation outcome detection (e.g., for page redirect)
-        postActionMinDelay: 200,    // Minimal delay after an action BEFORE checkReservationOutcome starts polling.
-        uiSelectedFloor: "3F",
-        uiSelectedPreference: "auto",
-        uiPreferredSeatNumber: "", // 现在存储字符串，逗号分隔
-        uiPanelMinimized: true // 默认折叠，显示迷你UI
-    };
+        async error(...args) {
+            console.error(`[${GM.info.script.name} ERROR]`, ...args);
+            try { await GM_log(`[${GM.info.script.name} ERROR]`, ...args); } catch (e) { /* silent */ }
+        },
 
-    let config = { ...defaultConfig };
-    const GM_CONFIG_KEY = 'libseat_auto_reserve_config_v1_4_4'; // 更新配置键名
+        parseSeatNumberFromName(seatName) {
+            if (!seatName) return NaN;
+            const matches = seatName.match(/\d+/g);
+            return matches && matches.length > 0 ? parseInt(matches[matches.length - 1], 10) : NaN;
+        },
 
-    // --- 快捷时间段配置 ---
-    const quickTimeRanges = [
-        { name: "全天", start: "08:15", end: "21:45" },
-        { name: "上午", start: "08:15", end: "12:00" },
-        { name: "下午1", start: "12:20", end: "15:20" },
-        { name: "下午2", start: "15:00", end: "18:00" },
-        { name: "晚上", start: "18:00", end: "21:45" }
-    ];
+        compileRule(ruleString) {
+            if (this.ruleRegexCache.has(ruleString)) return this.ruleRegexCache.get(ruleString);
+            let rule;
+            if (ruleString === "剩余的") {
+                rule = { type: "remaining" };
+            } else if (ruleString.match(/(\d+)\+(\d+)n,\s*n<(\d+)/)) {
+                const p = ruleString.match(/(\d+)\+(\d+)n,\s*n<(\d+)/);
+                rule = { type: "series", a: parseInt(p[1], 10), b: parseInt(p[2], 10), m: parseInt(p[3], 10) };
+            } else if (ruleString.match(/(\d+)-(\d+)/)) {
+                const p = ruleString.match(/(\d+)-(\d+)/);
+                rule = { type: "range", start: parseInt(p[1], 10), end: parseInt(p[2], 10) };
+            } else {
+                rule = { type: "unknown" };
+            }
+            this.ruleRegexCache.set(ruleString, rule);
+            return rule;
+        },
 
-    // --- 预编译规则正则缓存 ---
-    const ruleRegexCache = new Map();
+        matchesPreferenceRule(ruleString, seatNumber) {
+            if (!ruleString || isNaN(seatNumber)) return false;
+            const rule = this.compileRule(ruleString);
+            switch (rule.type) {
+                case "remaining": return true;
+                case "series": return Array.from({ length: rule.m }, (_, n) => rule.a + rule.b * n).includes(seatNumber);
+                case "range": return seatNumber >= rule.start && seatNumber <= rule.end;
+                default: return false;
+            }
+        },
 
-    // --- 日志函数 ---
-    async function log(...args) {
-        console.log(`[${GM.info.script.name}]`, ...args);
-        try {
-            await GM_log(`[${GM.info.script.name}]`, ...args);
-        } catch (e) { /* silent catch for GM_log if context is closing */ }
-    }
-    async function error(...args) {
-        console.error(`[${GM.info.script.name} ERROR]`, ...args);
-        try {
-            await GM_log(`[${GM.info.script.name} ERROR]`, ...args);
-        } catch (e) { /* silent catch for GM_log if context is closing */ }
-    }
+        getTomorrowFormattedDate() {
+            const tomorrow = new Date();
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const yyyy = tomorrow.getFullYear();
+            const mm = String(tomorrow.getMonth() + 1).padStart(2, '0');
+            const dd = String(tomorrow.getDate()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd}`;
+        },
 
-    // --- UI 状态更新函数 (提前定义，确保UI加载前可用) ---
-    // 此函数可能在同步上下文被调用，因此内部的 GM_log 不 await，以避免影响UI响应
-    function updateUIStatus(message) {
-        if (!uiReady || !uiElements.statusEl) {
-            console.log(`[${GM.info.script.name} Status]`, message);
-            try { GM_log(`[${GM.info.script.name} Status]`, message); } catch (e) {}
-            return;
-        }
-        uiElements.statusEl.textContent = message;
-    }
-
-    // --- 工具函数 ---
-    function parseSeatNumberFromName(seatName) {
-        if (!seatName) return NaN;
-        const matches = seatName.match(/\d+/g);
-        return matches && matches.length > 0 ? parseInt(matches[matches.length - 1], 10) : NaN;
-    }
-
-    function compileRule(ruleString) {
-        if (ruleRegexCache.has(ruleString)) {
-            return ruleRegexCache.get(ruleString);
-        }
-
-        let rule;
-        if (ruleString === "剩余的") {
-            rule = { type: "remaining" };
-        } else {
-            const patternMatch = ruleString.match(/(\d+)\+(\d+)n,\s*n<(\d+)/);
-            if (patternMatch) {
-                rule = {
-                    type: "series",
-                    a: parseInt(patternMatch[1], 10),
-                    b: parseInt(patternMatch[2], 10),
-                    m: parseInt(patternMatch[3], 10)
+        debounce(func, wait) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
                 };
-            } else {
-                const rangeMatch = ruleString.match(/(\d+)-(\d+)/);
-                if (rangeMatch) {
-                    rule = {
-                        type: "range",
-                        start: parseInt(rangeMatch[1], 10),
-                        end: parseInt(rangeMatch[2], 10)
-                    };
-                } else {
-                    rule = { type: "unknown" };
-                }
-            }
-        }
-
-        ruleRegexCache.set(ruleString, rule);
-        return rule;
-    }
-
-    function matchesPreferenceRule(ruleString, seatNumber) {
-        if (!ruleString || isNaN(seatNumber)) return false;
-        const rule = compileRule(ruleString);
-
-        switch (rule.type) {
-            case "remaining":
-                return true;
-            case "series":
-                for (let n = 0; n < rule.m; n++) {
-                    if (seatNumber === rule.a + rule.b * n) return true;
-                }
-                return false;
-            case "range":
-                return seatNumber >= rule.start && seatNumber <= rule.end;
-            default:
-                return false;
-        }
-    }
-
-    /**
-     * Helper to recursively find a Vue instance by its component name within a component tree.
-     */
-    function findVueInstance(rootVm, componentName) {
-        if (!rootVm) return null;
-        const vueInstance = rootVm.$vm || rootVm; // Try to get the actual Vue instance if rootVm is a UniApp page object
-        if (!vueInstance || typeof vueInstance !== 'object') return null;
-
-        const name = vueInstance.$options?.name || vueInstance.$options?._componentTag;
-        if (name === componentName) {
-            return vueInstance;
-        }
-
-        if (vueInstance.$children && vueInstance.$children.length > 0) {
-            for (let i = 0; i < vueInstance.$children.length; i++) {
-                const childVm = findVueInstance(vueInstance.$children[i], componentName);
-                if (childVm) {
-                    return childVm;
-                }
-            }
-        }
-        return null;
-    }
-
-    async function getFloorIdentifier(readingRoom) { // Made async for awaited log
-        if (!readingRoom) {
-            await log('getFloorIdentifier: vm.readingRoom is null or undefined.');
-            return null;
-        }
-
-        if (readingRoom.parentNamePath) {
-            const match = readingRoom.parentNamePath.match(/(\d+F)/);
-            if (match) {
-                await log(`getFloorIdentifier: Found floor '${match[1]}' from parentNamePath.`);
-                return match[1];
-            }
-        }
-
-        if (readingRoom.name) {
-            const match = readingRoom.name.match(/(\d+F)/);
-            if (match) {
-                await log(`getFloorIdentifier: Found floor '${match[1]}' from name.`);
-                return match[1];
-            }
-        }
-        
-        await log('getFloorIdentifier: Could not find floor identifier from vm.readingRoom.');
-        return null;
-    }
-
-    function getTomorrowFormattedDate() {
-        const tomorrow = new Date();
-        tomorrow.setDate(tomorrow.getDate() + 1);
-        const yyyy = tomorrow.getFullYear();
-        const mm = String(tomorrow.getMonth() + 1).padStart(2, '0');
-        const dd = String(tomorrow.getDate()).padStart(2, '0');
-        return `${yyyy}-${mm}-${dd}`;
-    }
-
-    // --- GM 函数异步处理 ---
-    async function safeGMGetValue(key, defaultValue) {
-        try {
-            const value = await GM_getValue(key, defaultValue);
-            return value;
-        } catch (e) {
-            await error(`GM_getValue 失败 (key: ${key}):`, e);
-            return defaultValue;
-        }
-    }
-
-    async function safeGMSetValue(key, value) {
-        try {
-            await GM_setValue(key, value);
-            await log(`Configuration saved to storage (key: ${key})`);
-            return true;
-        } catch (e) {
-            await error(`GM_setValue 失败 (key: ${key}):`, e);
-            return false;
-        }
-    }
-
-    async function loadConfig() {
-        try {
-            const storedConfig = await safeGMGetValue(GM_CONFIG_KEY, null);
-            if (storedConfig) {
-                const mergedSeatPreferences = { ...defaultConfig.seatPreferences, ...storedConfig.seatPreferences };
-                storedConfig.seatPreferences = mergedSeatPreferences;
-                config = { ...defaultConfig, ...storedConfig };
-                // Ensure targetDate is always set to tomorrow if empty or invalid
-                if (!config.targetDate || !/^\d{4}-\d{2}-\d{2}$/.test(config.targetDate)) {
-                    config.targetDate = getTomorrowFormattedDate();
-                }
-                await log("Loaded configuration from storage:", config);
-            } else {
-                await log("No stored configuration found, using default config.");
-                config.targetDate = getTomorrowFormattedDate(); // Default tomorrow
-            }
-        } catch (e) {
-            await error("Failed to load configuration from storage:", e);
-            config = { ...defaultConfig };
-            config.targetDate = getTomorrowFormattedDate(); // Default tomorrow
-        }
-    }
-
-    async function saveConfig() {
-        try {
-            const configToSave = {
-                autoStartAtSpecificTime: config.autoStartAtSpecificTime,
-                startHour: config.startHour,
-                startMinute: config.startMinute,
-                startSecond: config.startSecond,
-                targetDate: config.targetDate,
-                targetStartTime: config.targetStartTime,
-                targetEndTime: config.targetEndTime,
-                uiSelectedFloor: config.uiSelectedFloor,
-                uiSelectedPreference: config.uiSelectedPreference,
-                uiPreferredSeatNumber: config.uiPreferredSeatNumber,
-                uiPanelMinimized: config.uiPanelMinimized,
-                autoConfirmReservation: config.autoConfirmReservation,
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
             };
-            await safeGMSetValue(GM_CONFIG_KEY, configToSave);
-        } catch (e) {
-            await error("Failed to save configuration to storage:", e);
-        }
-    }
+        },
 
-    async function waitForUniAppPageVm() {
-        await log('Attempting to find UniApp Vue instance...');
-        return new Promise((resolve) => {
-            let retryCount = 0;
-            const maxRetriesForVm = 180; // 180 retries * 200ms = 36 seconds
+        safeClick(element) {
+            if (!element) return false;
+            try {
+                element.click();
+                return true;
+            } catch (e) {
+                Utils.error('Click failed:', e);
+                return false;
+            }
+        },
 
-            vmDiscoveryInterval = setInterval(async () => {
-                retryCount++;
-                if (retryCount > maxRetriesForVm) {
-                    clearInterval(vmDiscoveryInterval);
-                    await error('Max retries reached for finding root Vue instance. Script cannot proceed.');
-                    resolve(null);
-                    return;
+        findVueInstance(rootVm, componentName) {
+            if (!rootVm) return null;
+            const vueInstance = rootVm.$vm || rootVm;
+            if (!vueInstance || typeof vueInstance !== 'object') return null;
+            const name = vueInstance.$options?.name || vueInstance.$options?._componentTag;
+            if (name === componentName) return vueInstance;
+            if (vueInstance.$children && vueInstance.$children.length > 0) {
+                for (const child of vueInstance.$children) {
+                    const childVm = this.findVueInstance(child, componentName);
+                    if (childVm) return childVm;
                 }
+            }
+            return null;
+        },
 
-                let rootVm = null;
-                if (typeof getCurrentPages === 'function') {
-                    try {
+        async waitForUniAppPageVm() {
+            await this.log('Attempting to find UniApp Vue instance...');
+            return new Promise((resolve) => {
+                let retryCount = 0;
+                const maxRetries = 180; // 36 seconds
+                const interval = setInterval(async () => {
+                    if (retryCount++ > maxRetries) {
+                        clearInterval(interval);
+                        await this.error('Max retries reached for finding root Vue instance.');
+                        return resolve(null);
+                    }
+                    if (typeof getCurrentPages === 'function') {
                         const pages = getCurrentPages();
                         if (pages && pages.length > 0) {
-                            const currentPage = pages[pages.length - 1];
-                            rootVm = currentPage && (currentPage.$vm || currentPage.vm || (currentPage.$children && currentPage.$children[0]));
-                        }
-                    } catch (e) { /* ignore, try other methods */ }
-                }
-
-                if (!rootVm) {
-                    try {
-                        const vueInstances = document.querySelectorAll('[data-vue-app], [vue-app], [data-vue], #app');
-                        if (vueInstances.length > 0) {
-                            const appEl = vueInstances[0];
-                            rootVm = appEl.__vue__ || appEl._vue || appEl.vue;
-                        }
-                    } catch (e) { /* ignore */ }
-                }
-
-                if (rootVm) {
-                    const rootVmName = rootVm.$options?.name || rootVm.$options?._componentTag || 'N/A';
-                    if (rootVmName === TARGET_COMPONENT_NAME) {
-                        clearInterval(vmDiscoveryInterval);
-                        await log(`Successfully found target component (root VM itself): "${TARGET_COMPONENT_NAME}".`);
-                        resolve(rootVm);
-                    } else {
-                        const foundVm = findVueInstance(rootVm, TARGET_COMPONENT_NAME);
-                        if (foundVm) {
-                            clearInterval(vmDiscoveryInterval);
-                            await log(`Successfully found "${TARGET_COMPONENT_NAME}" VM via child components.`);
-                            resolve(foundVm);
-                        }
-                    }
-                }
-            }, 200);
-        });
-    }
-
-    // --- 核心抢座逻辑 ---
-
-    async function setTimeRange(vmInstance, date, startTime, endTime) {
-        await log(`Setting time range to: Date=${date}, Start=${startTime}, End=${endTime}`);
-        try {
-            const [startHour, startMin] = startTime.split(':').map(Number);
-            const [endHour, endMin] = endTime.split(':').map(Number);
-            if (isNaN(startHour) || isNaN(startMin) || isNaN(endHour) || isNaN(endMin) ||
-                startHour < 0 || startHour > 23 || startMin < 0 || startMin > 59 ||
-                endHour < 0 || endHour > 23 || endMin < 0 || endMin > 59) {
-                throw new Error(`Invalid time format: ${startTime} - ${endTime}`);
-            }
-
-            if (vmInstance.timeRange) {
-                vmInstance.timeRange.date = date;
-                vmInstance.timeRange.startTime = startTime;
-                vmInstance.timeRange.endTime = endTime;
-                
-                if (typeof vmInstance.$set === 'function') {
-                    vmInstance.$set(vmInstance.timeRange, 'date', date);
-                    vmInstance.$set(vmInstance.timeRange, 'startTime', startTime);
-                    vmInstance.$set(vmInstance.timeRange, 'endTime', endTime);
-                } else if (typeof vmInstance.$forceUpdate === 'function') {
-                    vmInstance.$forceUpdate();
-                } else {
-                    await log('Warning: $set or $forceUpdate not found, relying on direct assignment for timeRange which might not be reactive.');
-                }
-                
-                await new Promise(r => setTimeout(r, config.postActionMinDelay));
-                await log('timeRange updated in VM and applied.');
-            } else {
-                await error('vmInstance.timeRange is not available. Cannot set time range.');
-            }
-        } catch (e) {
-            await error('Error setting time range:', e);
-            throw e;
-        }
-    }
-
-    function safeClick(element) {
-        if (!element) return false;
-        try {
-            element.click();
-            return true;
-        } catch (e1) {
-            try {
-                const rect = element.getBoundingClientRect();
-                const clientX = rect.left + rect.width / 2;
-                const clientY = rect.top + rect.height / 2;
-
-                const downEvent = new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: clientX, clientY: clientY, button: 0 });
-                const upEvent = new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: clientX, clientY: clientY, button: 0 });
-                const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true, clientX: clientX, clientY: clientY, button: 0 });
-                element.dispatchEvent(downEvent);
-                element.dispatchEvent(upEvent);
-                element.dispatchEvent(clickEvent);
-                return true;
-            } catch (e2) {
-                try {
-                    const rect = element.getBoundingClientRect();
-                    const clientX = rect.left + rect.width / 2;
-                    const clientY = rect.top + rect.height / 2;
-
-                    const event = document.createEvent('MouseEvents');
-                    event.initMouseEvent('click', true, true, null, 0, 0, 0,
-                        clientX, clientY, false, false, false, false, 0, null);
-                    element.dispatchEvent(event);
-                    return true;
-                } catch (e3) {
-                    error('All click methods failed:', e3); // `error` is async, but not awaited here as safeClick is sync.
-                    return false;
-                }
-            }
-        }
-    }
-
-    async function isSeatStillAvailable(vmInstance, seatId) {
-        const now = Date.now();
-        const cached = seatCheckCache.get(seatId);
-        if (cached && now - cached.time < 3000) { // Cache validity: 3 seconds
-            await log(`Seat ${seatId} status from cache: ${cached.available}`);
-            return cached.available;
-        }
-        
-        try {
-            if (typeof vmInstance.getSeats === 'function' && 
-                (!vmInstance.lastSeatFetchTime || now - vmInstance.lastSeatFetchTime > 5000)) {
-                await log('Refreshing seat list before availability check...');
-                await vmInstance.getSeats();
-                vmInstance.lastSeatFetchTime = now;
-                await new Promise(r => setTimeout(r, 300));
-            }
-            const seat = vmInstance.seatList?.find(s => s.id === seatId);
-            const available = !!seat && seat.status === 'FREE' && seat.enabled;
-            seatCheckCache.set(seatId, { available, time: now });
-            await log(`Seat ${seatId} availability rechecked: ${available}`);
-            return available;
-        } catch (e) {
-            await error('Error checking seat availability:', e);
-            return false;
-        }
-    }
-
-    async function checkReservationOutcome(vmInstance, initialUrl) {
-        const MAX_WAIT_TIME = config.postActionMaxWait;
-        const INTERVAL_CHECK = 100;
-
-        let elapsedTime = 0;
-        let lastReservationResult = null;
-
-        await new Promise(r => setTimeout(r, config.postActionMinDelay));
-        await log(`[Outcome Check] Started polling after ${config.postActionMinDelay}ms delay. Max wait: ${MAX_WAIT_TIME}ms.`);
-
-        return new Promise(resolve => {
-            const checkInterval = setInterval(async () => {
-                elapsedTime += INTERVAL_CHECK;
-
-                if (window.location.href !== initialUrl) {
-                    clearInterval(checkInterval);
-                    await log(`[Outcome Check] Page redirected to: ${window.location.href}`);
-                    if (window.location.href.includes('/pages/user/reservation/reservation') ||
-                        window.location.href.includes('/pages/user/index') ||
-                        window.location.href.includes('/pages/reserve/seat-reserve/seat-history') ||
-                        window.location.href.includes('/pages/reserve/my-reserve/my-reserve')
-                    ) {
-                        return resolve({ status: 'success', message: '页面已跳转至预约成功页面或用户相关页面。' });
-                    }
-                    return resolve({ status: 'failure', message: `页面跳转到非预期地址: ${window.location.href}` });
-                }
-
-                if (vmInstance.reservationResult && vmInstance.reservationResult !== lastReservationResult) {
-                    await log(`[Outcome Check] vm.reservationResult changed:`, vmInstance.reservationResult);
-                    lastReservationResult = vmInstance.reservationResult;
-
-                    const res = vmInstance.reservationResult;
-                    if (res.statusCode === 200 || (res.data && (res.data.code === 0 || res.data.code === 'SUCCESS'))) {
-                        clearInterval(checkInterval);
-                        return resolve({ status: 'success', message: `VM API报告成功: ${res.data?.message || ''}` });
-                    } 
-                    else if (res.statusCode === 400 && res.data?.code === 'reservation.user_has_other_reservation') {
-                        clearInterval(checkInterval);
-                        return resolve({ status: 'failure_existing_reservation', message: res.data.message || '您已有其他申请或预约。' });
-                    } 
-                    else if (res.statusCode && res.data?.message) {
-                        clearInterval(checkInterval);
-                        return resolve({ status: 'failure', message: `VM API报告错误: ${res.data.message} (Code: ${res.statusCode})` });
-                    }
-                }
-
-                const successMsg = document.querySelector('.success-message, .toast-success, [class*="success"], [class*="el-message--success"]');
-                if (successMsg && successMsg.offsetParent !== null) {
-                    clearInterval(checkInterval);
-                    return resolve({ status: 'success', message: `检测到DOM成功消息: ${successMsg.textContent.trim()}` });
-                }
-
-                const errorMsgEl = document.querySelector('.error-message, .toast-error, [class*="error"], [class*="el-message--error"], .uni-toast-content, .uni-modal-content, .uni-dialog-content');
-                if (errorMsgEl && errorMsgEl.offsetParent !== null) {
-                    const fullErrorText = errorMsgEl.textContent.trim();
-                    if (fullErrorText.includes('已有其他申请或预约')) {
-                        clearInterval(checkInterval);
-                        return resolve({ status: 'failure_existing_reservation', message: `检测到DOM错误消息: ${fullErrorText}` });
-                    } else if (fullErrorText.includes('失败') || fullErrorText.includes('错误') || fullErrorText.includes('不可预约') || fullErrorText.includes('已存在') || fullErrorText.includes('被占用')) {
-                        clearInterval(checkInterval);
-                        return resolve({ status: 'failure', message: `检测到DOM错误消息: ${fullErrorText.substring(0, Math.min(fullErrorText.length, 100))}` });
-                    }
-                }
-
-                if (!vmInstance.seatReserveVisible && !document.querySelector('.uni-modal-mask') && elapsedTime > config.postActionMinDelay + 500) {
-                    clearInterval(checkInterval);
-                    return resolve({ status: 'failure', message: '预约模态框已关闭，但未检测到成功或错误消息，也未跳转。' });
-                }
-
-                if (elapsedTime >= MAX_WAIT_TIME) {
-                    clearInterval(checkInterval);
-                    return resolve({ status: 'timeout', message: '等待预约结果超时。' });
-                }
-            }, INTERVAL_CHECK);
-        });
-    }
-
-    function findConfirmButton() {
-        const primaryButtons = document.querySelectorAll('.seat-btn.seat-btn-primary, .btn-primary, [data-action="reserve"], button.primary, .modal-footer button:first-child, .modal-btn-confirm, button[data-type="primary"], .btn-success, [class*="reserve-btn"], [class*="confirm-btn"]');
-        for (const btn of primaryButtons) {
-            if (btn.offsetParent !== null) { // Check if button is visible
-                return btn;
-            }
-        }
-        
-        const allButtons = document.querySelectorAll('button, [role="button"], .btn, div[role="button"]');
-        for (const btn of allButtons) {
-            if (btn.offsetParent !== null) { // Check if button is visible
-                const text = btn.textContent.trim() || btn.innerText.trim();
-                if (text.includes('预约') || text.includes('确认') || text.includes('提交')) {
-                    return btn;
-                }
-            }
-        }
-        return null;
-    }
-
-    async function stopReservationLoopDueToCriticalError() {
-        if (抢座核心逻辑Timer) {
-            clearTimeout(抢座核心逻辑Timer);
-            抢座核心逻辑Timer = null;
-        }
-        isReservationLoopActive = false; // 重置状态
-
-        if (uiReady) {
-            uiElements.startBtn.style.display = 'inline-block';
-            uiElements.resetBtn.style.display = 'none';
-        }
-        await log('Reservation loop stopped due to critical error.');
-        updateUIStatus('抢座已停止，检测到不可恢复错误。请检查控制台。');
-        updateTimerDisplay(); // Ensure minimized UI buttons are updated
-    }
-
-    async function triggerVmReservation(vmInstance, seat) {
-        try {
-            await log('Trying to trigger reservation via VM methods...');
-            const initialUrl = window.location.href;
-            let vmMethodExecuted = false;
-            let directPromiseResult = null;
-
-            vmInstance.reservationResult = null;
-            await log('Cleared vm.reservationResult for a fresh check.');
-
-            if (typeof vmInstance.confirmReservation === 'function') {
-                await log('Calling vm.confirmReservation()');
-                vmMethodExecuted = true;
-                directPromiseResult = vmInstance.confirmReservation(seat)
-                    .then(res => ({ status: 'resolved', data: res }))
-                    .catch(err => ({ status: 'rejected', error: err }));
-            } else if (typeof vmInstance.submitReservation === 'function') {
-                await log('Calling vm.submitReservation()');
-                vmMethodExecuted = true;
-                directPromiseResult = vmInstance.submitReservation(seat)
-                    .then(res => ({ status: 'resolved', data: res }))
-                    .catch(err => ({ status: 'rejected', error: err }));
-            } else if (typeof vmInstance.reserveSeat === 'function') {
-                await log('Calling vm.reserveSeat()');
-                vmMethodExecuted = true;
-                directPromiseResult = vmInstance.reserveSeat(seat.id, vmInstance.timeRange)
-                    .then(res => ({ status: 'resolved', data: res }))
-                    .catch(err => ({ status: 'rejected', error: err }));
-            } else if (vmInstance.$emit) {
-                await log('Emitting "reserve" event via VM (no direct promise expected, relying on outcome check)');
-                vmInstance.$emit('reserve', seat);
-                vmMethodExecuted = true;
-            } else if (window.app && typeof window.app.reserve === 'function') {
-                await log('Calling window.app.reserve()');
-                vmMethodExecuted = true;
-                directPromiseResult = window.app.reserve(seat.id, vmInstance.timeRange)
-                    .then(res => ({ status: 'resolved', data: res }))
-                    .catch(err => ({ status: 'rejected', error: err }));
-            }
-
-            if (!vmMethodExecuted) {
-                await error('No known VM reservation method found or triggered successfully.');
-                return false;
-            }
-
-            const outcomePromise = checkReservationOutcome(vmInstance, initialUrl);
-            
-            if (directPromiseResult) {
-                const raceResult = await Promise.race([
-                    directPromiseResult.then(res => ({ type: 'direct_response', result: res })),
-                    outcomePromise.then(res => ({ type: 'outcome_check', result: res })),
-                    new Promise(r => setTimeout(() => r({ type: 'timeout_for_direct_response' }), config.postActionMaxWait))
-                ]);
-
-                if (raceResult.type === 'direct_response' && raceResult.result.status === 'rejected') {
-                    const errorData = raceResult.result.error?.data || raceResult.result.error;
-                    if (errorData?.code === 'reservation.user_has_other_reservation') {
-                        await error(`Direct VM promise rejected (critical): ${errorData.message}`);
-                        updateUIStatus(`预约失败: ${errorData.message} (已停止抢座)`);
-                        await stopReservationLoopDueToCriticalError();
-                        return false;
-                    } else {
-                        await log(`Direct VM promise rejected with general error:`, raceResult.result.error);
-                    }
-                }
-            }
-
-            const finalOutcome = await outcomePromise;
-
-            if (finalOutcome.status === 'success') {
-                await log(`VM triggered reservation success: ${finalOutcome.message}`);
-                return true;
-            } else if (finalOutcome.status === 'failure_existing_reservation') {
-                await error(`VM triggered reservation failed (critical): ${finalOutcome.message}`);
-                updateUIStatus(`预约失败: ${finalOutcome.message} (已停止抢座)`);
-                await stopReservationLoopDueToCriticalError();
-                return false;
-            } else {
-                await error(`VM triggered reservation failed: ${finalOutcome.message}`);
-                updateUIStatus(`VM预约失败: ${finalOutcome.message}`);
-                return false;
-            }
-        } catch (e) {
-            await error('Unexpected error during VM reservation trigger:', e);
-            updateUIStatus(`VM预约方法调用中发生意外错误: ${e.message}`);
-            return false;
-        }
-    }
-
-    async function selectAndReserveSeat(vmInstance, seat) {
-        if (!seat || !seat.id) {
-            await error('Invalid seat object provided for selection.');
-            return false;
-        }
-        
-        await log(`Attempting to select seat: ${seat.name} (ID: ${seat.id})`);
-        
-        try {
-            const isAvailable = await isSeatStillAvailable(vmInstance, seat.id);
-            if (!isAvailable) {
-                await error(`Seat ${seat.name} (ID: ${seat.id}) is no longer available (rechecked).`);
-                return false;
-            }
-
-            let seatSelected = false;
-            if (typeof vmInstance.selectSeat === 'function') {
-                await log(`Calling vm.selectSeat with seat: ${seat.id}`);
-                await vmInstance.selectSeat({ seat: seat, index: vmInstance.seatList.findIndex(s => s.id === seat.id) });
-                seatSelected = true;
-            } else if (typeof vmInstance.handleSeatClick === 'function') {
-                await log(`Calling vm.handleSeatClick with seat: ${seat.id}`);
-                await vmInstance.handleSeatClick(seat);
-                seatSelected = true;
-            } else {
-                await error('No direct seat selection method found on VM. Trying direct DOM click...');
-                const seatElement = document.querySelector(`[data-seat-id="${seat.id}"]`) || 
-                                   document.querySelector(`.seat-item[data-id="${seat.id}"]`) ||
-                                   document.querySelector(`.seat[data-seatid="${seat.id}"]`) ||
-                                   document.querySelector(`[id*="seat-${seat.id}"]`);
-
-                if (seatElement) {
-                    await log(`Found seat DOM element: ${seatElement.tagName}`);
-                    safeClick(seatElement);
-                    seatSelected = true;
-                } else {
-                    await error(`No seat DOM element found for seat ID: ${seat.id}.`);
-                    return false;
-                }
-            }
-            
-            if (!seatSelected) {
-                await error('Seat selection failed by all methods.');
-                return false;
-            }
-            
-            await log(`Seat ${seat.name} selected. Waiting for reservation modal...`);
-            await new Promise(r => setTimeout(r, config.postActionMinDelay));
-
-            let modalVisibleCheckRetries = 0;
-            const maxModalVisibleChecks = 20;
-            while (!vmInstance.seatReserveVisible && modalVisibleCheckRetries < maxModalVisibleChecks) {
-                await new Promise(r => setTimeout(r, 500));
-                modalVisibleCheckRetries++;
-                if (typeof vmInstance.openReservationModal === 'function' && modalVisibleCheckRetries === 3) {
-                    await log('Modal not visible, force opening reservation modal...');
-                    await vmInstance.openReservationModal(seat);
-                    await new Promise(r => setTimeout(r, config.postActionMinDelay));
-                }
-            }
-
-            if (vmInstance.seatReserveVisible) {
-                await log('Reservation modal is visible.');
-                
-                if (config.autoConfirmReservation) {
-                    await log('Auto-confirm is ON. Attempting VM reservation method directly...');
-                    
-                    const vmReservationSuccess = await triggerVmReservation(vmInstance, seat);
-                    if (vmReservationSuccess) {
-                        return true;
-                    } else {
-                        if (抢座核心逻辑Timer === null) { 
-                            await log('VM reservation method failed critically or stopped by existing reservation. Exiting selectAndReserveSeat.');
-                            return false;
-                        }
-                        await log(`VM reservation method failed for seat ${seat.name}. Trying DOM click fallback...`);
-
-                        let confirmButton = findConfirmButton();
-                        if (confirmButton) {
-                            await log(`Found confirm button for DOM click fallback: ${confirmButton.tagName} ${confirmButton.className || ''}`);
-                            confirmButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            await new Promise(r => setTimeout(r, config.postActionMinDelay));
-                            
-                            const initialUrl = window.location.href;
-                            vmInstance.reservationResult = null;
-                            await log('Cleared vm.reservationResult for DOM click fallback.');
-
-                            safeClick(confirmButton);
-                            await new Promise(r => setTimeout(r, config.postActionInitialWait));
-                            safeClick(confirmButton);
-                            await new Promise(r => setTimeout(r, config.postActionInitialWait));
-
-                            await log('Clicked the "预约/确认" button (DOM fallback). Waiting for reservation outcome...');
-                            const outcome = await checkReservationOutcome(vmInstance, initialUrl);
-
-                            if (outcome.status === 'success') {
-                                await log(`Reservation success (DOM click): ${outcome.message}`);
-                                updateUIStatus(`成功预约座位: ${seat.name}! (${outcome.message})`);
-                                return true;
-                            } else if (outcome.status === 'failure_existing_reservation') {
-                                await error(`Reservation failed (critical, DOM click): ${outcome.message}`);
-                                updateUIStatus(`预约失败: ${outcome.message} (已停止抢座)`);
-                                await stopReservationLoopDueToCriticalError();
-                                return false;
-                            } else {
-                                await error(`Reservation failed for seat ${seat.name} (DOM click): ${outcome.message}`);
-                                updateUIStatus(`座位 ${seat.name} 预约失败: ${outcome.message}`);
-                                return false;
+                            const rootVm = pages[pages.length - 1]?.$vm;
+                            const foundVm = this.findVueInstance(rootVm, this.TARGET_COMPONENT_NAME);
+                            if (foundVm) {
+                                clearInterval(interval);
+                                await this.log(`Successfully found "${this.TARGET_COMPONENT_NAME}" VM.`);
+                                return resolve(foundVm);
                             }
-                        } else {
-                            await error('Could not find the "预约/确认" button for DOM click fallback.');
-                            updateUIStatus(`错误: 无法找到预约按钮进行 DOM 点击。`);
-                            return false;
                         }
                     }
-                } else {
-                    await log('Auto-confirm is OFF. Reservation modal is open, please manually confirm.');
-                    updateUIStatus('自动确认已关闭。预约模态框已弹出，请手动确认。');
-                    return true;
-                }
-            } else {
-                await error('Reservation modal did not appear or vm.seatReserveVisible is false after multiple checks. Retrying is handled by reservationLoop.');
-                updateUIStatus(`错误: 预约模态框未弹出或超时。`);
-                return false;
-            }
-        } catch (e) {
-            await error('Error during seat selection/confirmation:', e);
-            updateUIStatus(`预约过程中发生意外错误: ${e.message}`);
-            return false;
-        }
-    }
-    
-    // 计算座位与目标座位号的距离
-    function getDistanceFromTargetSeat(seatNumber, target) {
-        return Math.abs(seatNumber - target);
-    }
-
-    // 解析逗号分隔的座位号字符串为数字数组
-    function parsePreferredSeatNumbers(inputString) {
-        if (!inputString) return [];
-        return inputString.split(',')
-                         .map(s => parseInt(s.trim(), 10))
-                         .filter(n => !isNaN(n) && n > 0); // 过滤掉无效数字和0
-    }
-
-    function filterAndSortSeats(seatList, floorId, preferredSeatNumbers) {
-        const preferences = config.seatPreferences[floorId] || [];
-        const validSeats = [];
-        const uiSelectedPreference = uiElements.preferenceSelect.value;
-        const isAutoMode = uiSelectedPreference === 'auto';
-
-        // 将偏好定义映射成Map，方便查找
-        const prefDefs = new Map(preferences.map(p => [p.type, p]));
-
-        // 定义分类的优先级顺序，这个顺序决定了座位被归类到哪个“类型”
-        // 用户期望的是 靠边 > 大理石 > 中间，这里的P1, P2, P3是实际分类后，用于排序的优先级
-        // 如果靠边是“剩余的”，那么它应该是最后被考虑分类的。
-        // 但由于用户期望“靠边”的优先级最高，这里的策略是：
-        // 1. 先尝试将座位分类到“大理石”或“中间”等具体偏好。
-        // 2. 如果不符合任何具体偏好，再将其分类为“靠边”（作为通用类型）。
-        // 3. 最后，根据这些分类类型对应的优先级（P1靠边，P2大理石，P3中间）进行排序。
-        const specificCategoryAssignmentOrder = ["大理石", "中间"]; // 先尝试具体分类
-
-        for (let i = 0; i < seatList.length; i++) {
-            const seat = seatList[i];
-            if (seat.type !== 'SEAT' || !seat.enabled || seat.status !== 'FREE') continue;
-            
-            let isBlacklisted = false;
-            for (let j = 0; j < config.globalBlacklistKeywords.length; j++) {
-                if (seat.name?.includes(config.globalBlacklistKeywords[j])) {
-                    isBlacklisted = true;
-                    break;
-                }
-            }
-            if (isBlacklisted) continue;
-
-            const seatNumber = parseSeatNumberFromName(seat.name);
-            if (isNaN(seatNumber)) continue;
-
-            let assignedCategoryType = "未分类";
-            let assignedCategoryPriority = Infinity; // 默认为最低优先级
-
-            if (isAutoMode) {
-                let specificTypeAssigned = false;
-                // 优先尝试将座位分类到具体的、非“剩余的”偏好类型
-                for (const typeName of specificCategoryAssignmentOrder) {
-                    const prefDef = prefDefs.get(typeName);
-                    if (prefDef && prefDef.rule !== "剩余的" && matchesPreferenceRule(prefDef.rule, seatNumber)) {
-                        assignedCategoryType = prefDef.type;
-                        assignedCategoryPriority = prefDef.priority;
-                        specificTypeAssigned = true;
-                        break; // 找到最具体的分类，跳出
-                    }
-                }
-
-                // 如果没有匹配到任何具体偏好，则尝试将其分类为“靠边”（如果定义为“剩余的”）
-                if (!specificTypeAssigned) {
-                    const byTheSidePref = prefDefs.get("靠边");
-                    if (byTheSidePref && byTheSidePref.rule === "剩余的") {
-                        assignedCategoryType = byTheSidePref.type;
-                        assignedCategoryPriority = byTheSidePref.priority;
-                    }
-                    // 如果“靠边”也有具体规则且未匹配，或者未定义，则保持“未分类”
-                }
-
-            } else { // 用户显式选择了某个地段偏好
-                const targetPrefDef = prefDefs.get(uiSelectedPreference);
-                if (targetPrefDef) {
-                    if (targetPrefDef.rule === "剩余的" || matchesPreferenceRule(targetPrefDef.rule, seatNumber)) {
-                        assignedCategoryType = targetPrefDef.type;
-                        assignedCategoryPriority = targetPrefDef.priority;
-                    }
-                }
-            }
-
-            const distanceFromTarget = getDistanceFromTargetSeat(seatNumber, DISTANCE_SORT_TARGET_SEAT);
-            validSeats.push({
-                ...seat,
-                seatNumber,
-                category: assignedCategoryType,
-                categoryPriority: assignedCategoryPriority,
-                distanceFromTarget,
-                isPreferred: preferredSeatNumbers.includes(seatNumber)
+                }, 200);
             });
-        }
-
-        // 严格按照用户指定的优先级进行多重排序
-        return validSeats.sort((a, b) => {
-            // 1. 首先，优先选择用户明确指定的喜欢座位号 (true在前)
-            if (a.isPreferred !== b.isPreferred) {
-                return a.isPreferred ? -1 : 1;
-            }
-
-            // 2. 其次，在是否喜欢相同的情况下，根据被分配的“地段偏好类型”的优先级排序 (数字越小优先级越高)
-            if (a.categoryPriority !== b.categoryPriority) {
-                return a.categoryPriority - b.categoryPriority;
-            }
-
-            // 3. 最后，在地段偏好优先级也相同的情况下，根据距离目标座位号的远近排序 (距离越小优先级越高)
-            return a.distanceFromTarget - b.distanceFromTarget;
-        });
-    }
-
-    async function fetchSeatListSafely(vmInstance) {
-        let retries = 0;
-        while (retries < FETCH_SEAT_MAX_RETRIES) {
-            try {
-                await log(`Fetching seats (attempt ${retries + 1}/${FETCH_SEAT_MAX_RETRIES})`);
-                if (typeof vmInstance.getSeats === 'function') {
-                    await vmInstance.getSeats();
-                } else if (typeof vmInstance.getSeatList === 'function') {
-                    await vmInstance.getSeatList();
-                } else if (typeof vmInstance.refreshSeats === 'function') {
-                    await vmInstance.refreshSeats();
-                } else if (typeof vmInstance.loadSeats === 'function') {
-                    await vmInstance.loadSeats();
-                } else {
-                    throw new Error('No seat fetch method found on VM.');
-                }
-
-                await new Promise(r => setTimeout(r, 500));
-                if (vmInstance.seatList && vmInstance.seatList.length > 0) {
-                    await log(`Fetched ${vmInstance.seatList.length} seats successfully.`);
-                    return true;
-                } else {
-                    retries++;
-                    await log(`Seat list is empty after fetch. Retrying (${retries}/${FETCH_SEAT_MAX_RETRIES})...`);
-                    await new Promise(r => setTimeout(r, FETCH_SEAT_RETRY_DELAY));
-                }
-            } catch (e) {
-                retries++;
-                await error(`Error fetching seats (${retries}/${FETCH_SEAT_MAX_RETRIES}):`, e.message);
-                await new Promise(r => setTimeout(r, FETCH_SEAT_RETRY_DELAY));
-            }
-        }
-        return false;
-    }
-
-    async function scheduleNextReservationAttempt() {
-        // 如果因为 critical error 而停止，则不再调度
-        if (抢座核心逻辑Timer === null && uiReady && uiElements.startBtn?.style.display === 'inline-block') {
-             await log('Reservation loop stopped by critical error, not rescheduling.');
-             updateTimerDisplay(); // 确保UI反映此状态
-             return;
-        }
-
-        if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
-        
-        const delay = config.retryInterval + (Math.random() * config.randomizeDelay * 2 - config.randomizeDelay);
-        updateUIStatus(`等待 ${Math.round(delay / 1000)} 秒后进行下一次尝试...`);
-        await log(`Scheduling next reservation attempt in ${delay / 1000} seconds.`);
-        
-        isReservationLoopActive = false; // 在调度下一轮任务时，核心循环是非活动状态
-        updateTimerDisplay(); // 更新UI，显示“等待下一次尝试”或“将于 XX:XX 自动抢座”
-
-        抢座核心逻辑Timer = setTimeout(() => {
-            reservationAttempts = 0;
-            reservationLoop(); // reservationLoop 会在开始时设置 isReservationLoopActive = true
-        }, delay);
-    }
-
-    async function reservationLoop() {
-        isReservationLoopActive = true; // 抢座核心逻辑开始执行
-        updateTimerDisplay(); // 立即更新UI为“正在抢座中...”
-        await log('Reservation loop started.');
-
-        // 抢座循环中的退出条件检查 (已有的逻辑)
-        if (抢座核心逻辑Timer === null && uiReady && uiElements.startBtn?.style.display === 'inline-block') {
-            await log('Reservation loop manually stopped or stopped by critical error. Exiting.');
-            isReservationLoopActive = false; // 重置状态
-            updateTimerDisplay();
-            return;
-        }
-
-        if (reservationAttempts >= MAX_RESERVATION_ATTEMPTS) {
-            updateUIStatus(`已达到最大抢座尝试次数(${MAX_RESERVATION_ATTEMPTS}次)，停止抢座`);
-            await log(`Reached maximum reservation attempts (${MAX_RESERVATION_ATTEMPTS}), stopping`);
-            
-            if (uiReady) {
-                uiElements.startBtn.style.display = 'inline-block';
-                uiElements.resetBtn.style.display = 'none';
-            }
-            
-            clearTimeout(抢座核心逻辑Timer);
-            抢座核心逻辑Timer = null;
-            isReservationLoopActive = false; // 重置状态
-            updateTimerDisplay();
-            return;
-        }
-
-        reservationAttempts++;
-        updateUIStatus(`正在进行第 ${reservationAttempts}/${MAX_RESERVATION_ATTEMPTS} 次抢座尝试`);
-        updateTimerDisplay(); // 再次确保所有UI元素更新，包括迷你UI的计数
-
-        if (!vm) {
-            updateUIStatus(`第 ${reservationAttempts} 次尝试：查找Vue实例...`);
-            vm = await waitForUniAppPageVm();
-            if (!vm) {
-                updateUIStatus('错误: 无法找到UniApp Vue实例，重试...');
-                await error('Failed to find UniApp Vue instance.');
-                isReservationLoopActive = false; // 重置状态
-                await scheduleNextReservationAttempt();
-                return;
-            }
-            updateUIStatus(`第 ${reservationAttempts} 次尝试：Vue实例已找到`);
-        }
-
-        const uiTargetDate = uiElements.resDateInput.value;
-        const uiStartTime = uiElements.resStartTimeInput.value;
-        const uiEndTime = uiElements.resEndTimeInput.value;
-        const preferredSeatNumbers = parsePreferredSeatNumbers(uiElements.preferredSeatNumberInput.value); // 解析多选座位号
-
-        if (!uiTargetDate || !/^\d{4}-\d{2}-\d{2}$/.test(uiTargetDate)) {
-            updateUIStatus('错误: 预约日期格式无效 (YYYY-MM-DD)');
-            await error('Invalid reservation date format.');
-            isReservationLoopActive = false; // 重置状态
-            await stopReservationLoopDueToCriticalError(); // Critical error, stop loop entirely
-            return;
-        }
-        if (!uiStartTime || !/^\d{2}:\d{2}$/.test(uiStartTime) || !uiEndTime || !/^\d{2}:\d{2}$/.test(uiEndTime)) {
-            updateUIStatus('错误: 预约时间格式无效 (HH:MM)');
-            await error('Invalid reservation time format.');
-            isReservationLoopActive = false; // 重置状态
-            await stopReservationLoopDueToCriticalError(); // Critical error, stop loop entirely
-            return;
-        }
-
-        const startMoment = new Date(`${uiTargetDate} ${uiStartTime}`);
-        let endMoment = new Date(`${uiTargetDate} ${uiEndTime}`);
-        if (endMoment.getTime() <= startMoment.getTime()) {
-             endMoment.setDate(endMoment.getDate() + 1);
-             if (endMoment.getTime() <= startMoment.getTime()) {
-                 updateUIStatus('错误: 结束时间必须晚于开始时间，请检查日期和时间设置。');
-                 await error('Reservation end time must be after start time, even with day increment.');
-                 isReservationLoopActive = false; // 重置状态
-                 await stopReservationLoopDueToCriticalError(); // Critical error, stop loop entirely
-                 return;
-             }
-        }
-
-        updateUIStatus(`第 ${reservationAttempts} 次尝试：设置时间范围 ${uiTargetDate} ${uiStartTime}-${uiEndTime}...`);
-        try {
-            await setTimeRange(vm, uiTargetDate, uiStartTime, uiEndTime);
-        } catch (e) {
-            updateUIStatus(`第 ${reservationAttempts} 次尝试：设置时间范围失败`);
-            await error('Failed to set time range:', e);
-            isReservationLoopActive = false; // 重置状态
-            await scheduleNextReservationAttempt();
-            return;
-        }
-
-        updateUIStatus(`第 ${reservationAttempts} 次尝试：获取座位列表...`);
-        const fetchSuccess = await fetchSeatListSafely(vm);
-        if (!fetchSuccess) {
-            updateUIStatus(`第 ${reservationAttempts} 次尝试：获取座位列表失败或为空`);
-            isReservationLoopActive = false; // 重置状态
-            await scheduleNextReservationAttempt();
-            return;
-        }
-
-        updateUIStatus(`第 ${reservationAttempts} 次尝试：筛选并排序座位...`);
-
-        let actualFloorIdForSorting = uiElements.floorSelect.value;
-        if (actualFloorIdForSorting === 'auto') {
-            const detectedFloor = await getFloorIdentifier(vm.readingRoom); // Await here
-            if (detectedFloor) {
-                actualFloorIdForSorting = detectedFloor;
-                await log(`Detected floor: ${detectedFloor}, using for preferences.`);
-            } else {
-                actualFloorIdForSorting = defaultConfig.uiSelectedFloor;
-                updateUIStatus(`警告: 无法自动检测楼层，已使用默认楼层 (${actualFloorIdForSorting}) 进行偏好筛选。`);
-            }
-        }
-
-        const sortedSeats = filterAndSortSeats(vm.seatList, actualFloorIdForSorting, preferredSeatNumbers);
-
-        if (sortedSeats.length === 0) {
-            updateUIStatus(`第 ${reservationAttempts} 次尝试：没有找到符合条件的座位`);
-            await log('No suitable seats found after filtering.');
-            isReservationLoopActive = false; // 重置状态
-            await scheduleNextReservationAttempt();
-            return;
-        }
-
-        updateUIStatus(`第 ${reservationAttempts} 次尝试：找到 ${sortedSeats.length} 个符合条件的座位，尝试预约最优座位...`);
-        await log(`Found ${sortedSeats.length} valid seats. Trying top candidates.`);
-
-        const maxAttemptsPerRound = Math.min(3, sortedSeats.length);
-        for (let i = 0; i < maxAttemptsPerRound; i++) {
-            const targetSeat = sortedSeats[i];
-            await log(`Attempting to reserve seat #${i+1}: ${targetSeat.name} (ID: ${targetSeat.id}, Category: ${targetSeat.category}, Priority: ${targetSeat.categoryPriority}, DistanceFrom${DISTANCE_SORT_TARGET_SEAT}: ${targetSeat.distanceFromTarget}, IsPreferred: ${targetSeat.isPreferred})`);
-            updateUIStatus(`尝试预约座位 ${targetSeat.name} (类型: ${targetSeat.category}, 优先级: ${targetSeat.categoryPriority}, 距离${DISTANCE_SORT_TARGET_SEAT}: ${targetSeat.distanceFromTarget})`);
-            
-            const reservationSuccess = await selectAndReserveSeat(vm, targetSeat);
-            if (reservationSuccess) {
-                updateUIStatus(`成功预约座位: ${targetSeat.name}!`);
-                await log(`Successfully reserved seat: ${targetSeat.name}`);
-                
-                if (uiReady) {
-                    uiElements.startBtn.style.display = 'inline-block';
-                    uiElements.resetBtn.style.display = 'none';
-                }
-                
-                clearTimeout(抢座核心逻辑Timer);
-                抢座核心逻辑Timer = null;
-                isReservationLoopActive = false; // 重置状态
-                updateTimerDisplay();
-                return;
-            } else {
-                if (抢座核心逻辑Timer === null) { // 已被 critical error 停止
-                    await log('Reservation loop stopped by critical error during seat selection.');
-                    isReservationLoopActive = false; // 重置状态
-                    return;
-                }
-                await log(`Failed to reserve seat ${targetSeat.name}, trying next preferred seat if available.`);
-                updateUIStatus(`座位 ${targetSeat.name} 预约失败，尝试下一个...`);
-            }
-        }
-
-        // 如果本轮所有候选座位都预约失败
-        updateUIStatus(`第 ${reservationAttempts} 次尝试：所有候选座位预约失败`);
-        isReservationLoopActive = false; // 重置状态
-        await scheduleNextReservationAttempt(); // 调度下一次尝试
-    }
-
-
-    // --- UI 相关函数 ---
-    let uiElements = {}; // 存储所有UI元素的引用
-    let uiReady = false; // 标记UI是否已成功创建并初始化
-
-    function createUI() {
-        if (document.getElementById('libseat-reservation-panel')) {
-            // UI已经存在，只重新初始化其状态和事件监听（防止重复添加）
-            log('UI面板元素已存在，重新初始化状态和事件监听。');
-            initializeUIElementsAndState();
-            return;
-        }
-
-        const panel = document.createElement('div');
-        panel.id = 'libseat-reservation-panel';
-        panel.style.cssText = `
-            position: fixed; top: 20px; right: 20px; z-index: 9999;
-            background: white; padding: 10px; border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; font-size: 14px;
-            color: #333; transition: all 0.3s ease-in-out;
-            max-height: 90vh; overflow-y: auto;
-            min-width: 220px; /* 确保最小宽度，防止在迷你模式下完全折叠 */
-        `;
-
-        panel.innerHTML = `
-            <style>
-                #libseat-reservation-panel * { box-sizing: border-box; }
-                #libseat-reservation-panel .header {
-                    display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;
-                    padding-bottom: 5px; border-bottom: 1px solid #eee;
-                }
-                #libseat-reservation-panel h3 { margin: 0; color: #333; font-size: 16px; white-space: nowrap; }
-                #libseat-reservation-panel button {
-                    background: none; border: none; cursor: pointer; font-size: 16px;
-                    color: #666; transition: color 0.2s;
-                }
-                #libseat-reservation-panel button:hover { color: #000; }
-                #libseat-reservation-panel label {
-                    display: block; margin-bottom: 5px; font-weight: bold; color: #555;
-                }
-                #libseat-reservation-panel select,
-                #libseat-reservation-panel input[type="date"],
-                #libseat-reservation-panel input[type="time"],
-                #libseat-reservation-panel input[type="text"], /* New: for preferred seat numbers */
-                #libseat-reservation-panel input[type="number"] {
-                    width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px;
-                    font-size: 14px; color: #333;
-                }
-                #libseat-reservation-panel .input-group-row {
-                    display: flex; gap: 8px; margin-bottom: 10px;
-                    align-items: center;
-                }
-                #libseat-reservation-panel .input-group-row > span {
-                    margin-top: -15px; /* Adjust vertical alignment for '-' */
-                }
-                #libseat-reservation-panel .input-group-item {
-                    flex: 1;
-                }
-                #libseat-reservation-panel .quick-time-ranges {
-                    display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px;
-                }
-                #libseat-reservation-panel .quick-time-btn {
-                    padding: 5px 10px; font-size: 12px; background: #e0e0e0; border: 1px solid #ccc; border-radius: 4px; cursor: pointer;
-                    color: #555; transition: background 0.2s, color 0.2s, border-color 0.2s;
-                }
-                #libseat-reservation-panel .quick-time-btn:hover {
-                    background: #d0d0d0; border-color: #bbb; color: #333;
-                }
-                #libseat-reservation-panel .checkbox-group {
-                    display: flex; align-items: center; margin-bottom: 10px;
-                }
-                #libseat-reservation-panel .checkbox-group input[type="checkbox"] {
-                    margin-right: 8px; width: auto; transform: scale(1.1);
-                }
-                #libseat-reservation-panel #start-reserve-btn,
-                #libseat-reservation-panel #reset-reserve-btn,
-                #libseat-reservation-panel #refresh-seats-btn {
-                    padding: 10px; border: none; border-radius: 4px; color: white; font-weight: bold; cursor: pointer;
-                    font-size: 15px; transition: background 0.2s;
-                }
-                #libseat-reservation-panel #start-reserve-btn { background: #4CAF50; }
-                #libseat-reservation-panel #start-reserve-btn:hover { background: #43A047; }
-                #libseat-reservation-panel #reset-reserve-btn { background: #FF9800; color: white; }
-                #libseat-reservation-panel #reset-reserve-btn:hover { background: #FB8C00; }
-                #libseat-reservation-panel #refresh-seats-btn { background: #2196F3; }
-                #libseat-reservation-panel #refresh-seats-btn:hover { background: #1976D2; }
-                #libseat-reservation-panel #reservation-status {
-                    padding: 10px; background: #e8f5e9; border-radius: 4px; min-height: 20px; color: #2e7d32; margin-top: 15px;
-                    font-size: 13px; text-align: center; border: 1px solid #c8e6c9;
-                }
-                #libseat-reservation-panel #minimized-panel-content {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                    margin-top: 5px;
-                }
-                #libseat-reservation-panel #minimized-panel-content button {
-                    background-color: #f8f8f8;
-                    border: 1px solid #e0e0e0;
-                    color: #333;
-                    font-weight: normal;
-                    padding: 8px 10px;
-                    font-size: 13px;
-                    border-radius: 4px;
-                    width: 100%;
-                    text-align: center;
-                    transition: background-color 0.2s, opacity 0.2s;
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }
-                #libseat-reservation-panel #minimized-panel-content button:hover:not(:disabled) {
-                    background-color: #f0f0f0;
-                }
-                #libseat-reservation-panel #minimized-panel-content button:disabled {
-                    opacity: 0.6;
-                    cursor: not-allowed;
-                }
-            </style>
-            <div class="header">
-                <h3>QIshan今天抢到座位了吗</h3>
-                <button id="minimize-panel">▾</button>
-            </div>
-            
-            <div id="minimized-panel-content">
-                <button id="minimized-start-reserve-btn" title="点击立即开始抢座">
-                    手动立刻抢座
-                </button>
-                <button id="minimized-show-time-btn" title="点击展开设置面板，查看和修改预约时间">
-                    预约时间: 就绪
-                </button>
-            </div>
-
-            <div id="panel-content">
-                <div class="input-group-row">
-                    <div class="input-group-item">
-                        <label for="floor-select">楼层:</label>
-                        <select id="floor-select"></select>
-                    </div>
-                    <div class="input-group-item">
-                        <label for="preference-select">地段偏好:</label>
-                        <select id="preference-select"></select>
-                    </div>
-                </div>
-                
-                <div>
-                    <label for="res-date-input">预约日期:</label>
-                    <input type="date" id="res-date-input">
-                </div>
-                
-                <div>
-                    <label>时间段:</label>
-                    <div class="input-group-row">
-                        <input type="time" id="res-start-time" class="input-group-item">
-                        <span>-</span>
-                        <input type="time" id="res-end-time" class="input-group-item">
-                    </div>
-                    <div class="quick-time-ranges">
-                        ${quickTimeRanges.map(range => `
-                            <button class="quick-time-btn" data-start="${range.start}" data-end="${range.end}">${range.name}</button>
-                        `).join('')}
-                    </div>
-                </div>
-                
-                <div>
-                    <label for="preferred-seat-number">喜欢座位号 (多个以逗号分隔，优先选择):</label>
-                    <input type="text" id="preferred-seat-number" placeholder="如: 40, 41, 42">
-                </div>
-                
-                <div class="checkbox-group">
-                    <input type="checkbox" id="auto-start-toggle" ${config.autoStartAtSpecificTime ? 'checked' : ''}>
-                    <label for="auto-start-toggle">定时自动抢座</label>
-                </div>
-                <div class="input-group-row">
-                    <div class="input-group-item">
-                        <label for="start-hour">时:</label>
-                        <input type="number" id="start-hour" min="0" max="23">
-                    </div>
-                    <div class="input-group-item">
-                        <label for="start-minute">分:</label>
-                        <input type="number" id="start-minute" min="0" max="59">
-                    </div>
-                    <div class="input-group-item">
-                        <label for="start-second">秒:</label>
-                        <input type="number" id="start-second" min="0" max="59">
-                    </div>
-                </div>
-
-                <div class="checkbox-group">
-                    <input type="checkbox" id="auto-confirm" ${config.autoConfirmReservation ? 'checked' : ''}>
-                    <label for="auto-confirm">自动确认预约</label>
-                </div>
-                
-                <div style="display: flex; gap: 10px; margin-top: 15px;">
-                    <button id="start-reserve-btn" style="flex: 2;">开始抢座</button>
-                    <button id="refresh-seats-btn" style="flex: 1;">刷新</button>
-                    <button id="reset-reserve-btn" style="flex: 2; display: none;">重置抢座</button>
-                </div>
-                
-                <div id="reservation-status">就绪，请设置参数并点击开始</div>
-            </div>
-        `;
-
-        document.body.appendChild(panel);
-        log('尝试将UI面板附加到document.body。');
-        initializeUIElementsAndState(); // 初始化UI元素引用和状态
-        uiReady = true; // 标记UI已就绪
-    }
-
-    function initializeUIElementsAndState() {
-        uiElements.panel = document.getElementById('libseat-reservation-panel');
-        if (!uiElements.panel) {
-            log('警告: 在初始化期间未找到UI面板元素。');
-            uiReady = false;
-            return;
-        }
-
-        uiElements.floorSelect = document.getElementById('floor-select');
-        uiElements.preferenceSelect = document.getElementById('preference-select');
-        uiElements.resDateInput = document.getElementById('res-date-input');
-        uiElements.resStartTimeInput = document.getElementById('res-start-time');
-        uiElements.resEndTimeInput = document.getElementById('res-end-time');
-        uiElements.preferredSeatNumberInput = document.getElementById('preferred-seat-number');
-        uiElements.autoConfirmToggle = document.getElementById('auto-confirm');
-        uiElements.autoStartToggle = document.getElementById('auto-start-toggle');
-        uiElements.startHourInput = document.getElementById('start-hour');
-        uiElements.startMinuteInput = document.getElementById('start-minute');
-        uiElements.startSecondInput = document.getElementById('start-second');
-        uiElements.startBtn = document.getElementById('start-reserve-btn');
-        uiElements.resetBtn = document.getElementById('reset-reserve-btn');
-        uiElements.refreshBtn = document.getElementById('refresh-seats-btn');
-        uiElements.minimizeBtn = document.getElementById('minimize-panel');
-        uiElements.minimizedStartReserveBtn = document.getElementById('minimized-start-reserve-btn');
-        uiElements.minimizedShowTimeBtn = document.getElementById('minimized-show-time-btn');
-        uiElements.panelContent = document.getElementById('panel-content');
-        uiElements.minimizedPanelContent = document.getElementById('minimized-panel-content');
-        uiElements.statusEl = document.getElementById('reservation-status'); // 新增状态元素引用
-
-        // 应用配置中的初始值
-        uiElements.floorSelect.value = config.uiSelectedFloor;
-        uiElements.preferenceSelect.value = config.uiSelectedPreference;
-        uiElements.preferredSeatNumberInput.value = config.uiPreferredSeatNumber || ''; // 保持为字符串
-        uiElements.autoConfirmToggle.checked = config.autoConfirmReservation;
-        uiElements.resDateInput.value = config.targetDate; // 确保使用从config加载的值（已默认明天）
-        uiElements.resStartTimeInput.value = config.targetStartTime;
-        uiElements.resEndTimeInput.value = config.targetEndTime;
-        uiElements.autoStartToggle.checked = config.autoStartAtSpecificTime;
-        uiElements.startHourInput.value = config.startHour;
-        uiElements.startMinuteInput.value = config.startMinute;
-        uiElements.startSecondInput.value = config.startSecond;
-
-        // 确保事件监听器只添加一次
-        if (!uiElements.panel.dataset.listenersAdded) {
-            setupEventListeners();
-            uiElements.panel.dataset.listenersAdded = 'true';
-        }
-        
-        // 应用初始面板状态 (最小化/展开)
-        togglePanelVisibility(config.uiPanelMinimized, true); // 传递 true 跳过保存配置
-        updateTimerDisplay(); // 刷新显示
-    }
-
-    // 设置所有事件监听器
-    function setupEventListeners() {
-        uiElements.minimizeBtn.addEventListener('click', async () => {
-            await togglePanelVisibility(!config.uiPanelMinimized);
-        });
-
-        if (uiElements.minimizedStartReserveBtn) {
-            uiElements.minimizedStartReserveBtn.addEventListener('click', async () => {
-                if (uiElements.minimizedStartReserveBtn.disabled) {
-                    await log('迷你抢座按钮已禁用。');
-                    return; 
-                }
-                reservationAttempts = 0;
-                if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
-                抢座核心逻辑Timer = setTimeout(() => reservationLoop(), 100);
-                updateUIStatus('开始抢座...');
-                updateTimerDisplay(); // 立即更新UI状态为“抢座中...”
-            });
-        }
-
-        if (uiElements.minimizedShowTimeBtn) {
-            uiElements.minimizedShowTimeBtn.addEventListener('click', async () => {
-                await togglePanelVisibility(false);
-            });
-        }
-
-        const updateAndSaveConfig = async (prop, value) => {
-            config[prop] = value;
-            await saveConfig();
-            updateTimerDisplay(); // Update time display if time config changes
-        };
-
-        uiElements.floorSelect.addEventListener('change', async () => {
-            await updateAndSaveConfig('uiSelectedFloor', uiElements.floorSelect.value);
-            await updateFloorAndPreferenceOptions(); // Re-populate preferences based on new floor and await it
-        });
-        uiElements.preferenceSelect.addEventListener('change', async () => {
-            await updateAndSaveConfig('uiSelectedPreference', uiElements.preferenceSelect.value);
-        });
-        uiElements.resDateInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('targetDate', uiElements.resDateInput.value);
-        });
-        uiElements.resStartTimeInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('targetStartTime', uiElements.resStartTimeInput.value);
-        });
-        uiElements.resEndTimeInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('targetEndTime', uiElements.resEndTimeInput.value);
-        });
-        uiElements.preferredSeatNumberInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('uiPreferredSeatNumber', uiElements.preferredSeatNumberInput.value.trim()); // 保存为字符串
-        });
-        uiElements.autoConfirmToggle.addEventListener('change', async () => {
-            await updateAndSaveConfig('autoConfirmReservation', uiElements.autoConfirmToggle.checked);
-        });
-
-        uiElements.autoStartToggle.addEventListener('change', async () => {
-            await updateAndSaveConfig('autoStartAtSpecificTime', uiElements.autoStartToggle.checked);
-            await scheduleAutoStart();
-        });
-        uiElements.startHourInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('startHour', parseInt(uiElements.startHourInput.value, 10));
-            await scheduleAutoStart();
-        });
-        uiElements.startMinuteInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('startMinute', parseInt(uiElements.startMinuteInput.value, 10));
-            await scheduleAutoStart();
-        });
-        uiElements.startSecondInput.addEventListener('change', async () => {
-            await updateAndSaveConfig('startSecond', parseInt(uiElements.startSecondInput.value, 10));
-            await scheduleAutoStart();
-        });
-
-        uiElements.startBtn.addEventListener('click', () => {
-            reservationAttempts = 0;
-            if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
-            抢座核心逻辑Timer = setTimeout(() => reservationLoop(), 100);
-            updateUIStatus('开始抢座...');
-            updateTimerDisplay();
-        });
-
-        uiElements.resetBtn.addEventListener('click', () => {
-            if (抢座核心逻辑Timer) clearTimeout(抢座核心逻辑Timer);
-            抢座核心逻辑Timer = null;
-            isReservationLoopActive = false; // 重置状态
-            updateUIStatus('抢座已重置。');
-            if (config.autoStartAtSpecificTime) {
-                scheduleAutoStart();
-            }
-            updateTimerDisplay();
-        });
-
-        uiElements.refreshBtn.addEventListener('click', async () => {
-            if (!vm) {
-                updateUIStatus('错误: 无法找到 UniApp Vue 实例。请先启动抢座或等待页面加载。');
-                return;
-            }
-            updateUIStatus('正在手动刷新座位列表...');
-            try {
-                const manualDate = uiElements.resDateInput.value;
-                const manualStartTime = uiElements.resStartTimeInput.value;
-                const manualEndTime = uiElements.resEndTimeInput.value;
-
-                if (!manualDate || !/^\d{4}-\d{2}-\d{2}$/.test(manualDate) || 
-                    !manualStartTime || !/^\d{2}:\d{2}$/.test(manualStartTime) || 
-                    !manualEndTime || !/^\d{2}:\d{2}$/.test(manualEndTime)) {
-                     updateUIStatus('错误: 日期/时间输入无效，无法刷新座位。请检查输入格式。');
-                     return;
-                }
-                
-                await setTimeRange(vm, manualDate, manualStartTime, manualEndTime);
-                await fetchSeatListSafely(vm);
-
-                let availableSeatsCount = 0;
-                if (vm.seatList && vm.seatList.length > 0) {
-                    availableSeatsCount = vm.seatList.filter(seat =>
-                        seat.type === 'SEAT' &&
-                        seat.enabled &&
-                        seat.status === 'FREE' &&
-                        !config.globalBlacklistKeywords.some(keyword => seat.name?.includes(keyword))
-                    ).length;
-                }
-                updateUIStatus(`座位刷新成功。目前可选座位数: ${availableSeatsCount}`);
-            } catch (e) {
-                await error('手动刷新座位失败:', e);
-                updateUIStatus('错误: 手动刷新座位失败。请检查控制台获取更多信息。');
-            }
-        });
-
-        document.querySelectorAll('.quick-time-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                uiElements.resStartTimeInput.value = btn.dataset.start;
-                uiElements.resEndTimeInput.value = btn.dataset.end;
-                uiElements.resStartTimeInput.dispatchEvent(new Event('change'));
-                uiElements.resEndTimeInput.dispatchEvent(new Event('change'));
-            });
-        });
-    }
-
-    async function togglePanelVisibility(isMinimized, skipSave = false) {
-        if (!uiReady || !uiElements.panel) return;
-
-        config.uiPanelMinimized = isMinimized;
-        uiElements.panelContent.style.display = config.uiPanelMinimized ? 'none' : 'block';
-        uiElements.minimizedPanelContent.style.display = config.uiPanelMinimized ? 'flex' : 'none';
-        uiElements.minimizeBtn.textContent = config.uiPanelMinimized ? '▾' : '▴';
-        setPanelWidth(config.uiPanelMinimized);
-        
-        if (!config.uiPanelMinimized) { // 展开视图
-            if (isReservationLoopActive) { // 如果抢座正在进行，则隐藏“开始”，显示“重置”
-                uiElements.startBtn.style.display = 'none';
-                uiElements.resetBtn.style.display = 'inline-block';
-            } else { // 否则显示“开始”
-                uiElements.startBtn.style.display = 'inline-block';
-                uiElements.resetBtn.style.display = 'none';
-            }
-        } else { // 最小化视图，确保主按钮隐藏
-            uiElements.startBtn.style.display = 'none';
-            uiElements.resetBtn.style.display = 'none';
-        }
-
-        if (!skipSave) await saveConfig();
-        updateTimerDisplay(); // 刷新显示
-    }
-
-    const setPanelWidth = (isMinimized) => {
-        if (uiElements.panel) {
-            // 调整展开时的宽度以适应下拉框，并调整最小化宽度
-            uiElements.panel.style.width = isMinimized ? '220px' : '350px'; 
-            uiElements.panel.style.padding = isMinimized ? '10px' : '15px';
         }
     };
 
-    async function updateFloorAndPreferenceOptions() { // 声明为async
-        if (!uiReady || !uiElements.floorSelect || !uiElements.preferenceSelect) {
-            log('警告: UI元素未就绪，无法更新楼层和偏好选项。');
-            return;
-        }
+    // =================================================================================
+    // --- [模块] 配置管理器 (ConfigManager) ---
+    // =================================================================================
+    const ConfigManager = {
+        key: 'libseat_auto_reserve_config_v1_5_1', // 键名保持不变以兼容旧配置
+        config: {},
+        defaultConfig: {
+            autoStartAtSpecificTime: true,
+            startHour: 21, startMinute: 0, startSecond: 1,
+            targetDate: "", targetStartTime: "08:00", targetEndTime: "22:00",
+            seatPreferences: {
+                "3F": [
+                    { type: "靠边", rule: "剩余的", priority: 1 },
+                    { type: "大理石", rule: "29-59", priority: 2 },
+                    { type: "中间", rule: "61+3n, n<12", priority: 3 }
+                ],
+                "2F": [
+                    { type: "靠边", rule: "37-84", priority: 1 },
+                    { type: "大理石", rule: "85-102", priority: 2 },
+                    { type: "中间", rule: "2+3n, n<12", priority: 3 }
+                ]
+            },
+            globalBlacklistKeywords: ["设备损坏", "禁"],
+            autoConfirmReservation: true,
+            retryInterval: 2000, randomizeDelay: 500,
+            postActionMaxWait: 5000, postActionMinDelay: 200,
+            uiSelectedFloor: "3F", uiSelectedPreference: "auto",
+            uiPreferredSeatNumber: "", uiPanelMinimized: true,
 
-        uiElements.floorSelect.innerHTML = '';
-        uiElements.preferenceSelect.innerHTML = '';
+            // [新增的速度配置项]
+            refreshInterval: 1500,     // 刷新座位列表的间隔 (毫秒)
+            postSelectionDelay: 300,   // 点击座位后等待弹窗的延迟 (毫秒)
+        },
 
-        const autoFloorOption = document.createElement('option');
-        autoFloorOption.value = 'auto';
-        autoFloorOption.textContent = '自动检测楼层 (推荐)';
-        uiElements.floorSelect.appendChild(autoFloorOption);
+        async load() {
+            try {
+                const storedConfig = await GM_getValue(this.key, null);
+                // [核心修改] 使用新的 defaultConfig，确保新配置项存在
+                this.config = { ...this.defaultConfig, ...storedConfig };
+                if (!this.config.targetDate || !/^\d{4}-\d{2}-\d{2}$/.test(this.config.targetDate)) {
+                    this.config.targetDate = Utils.getTomorrowFormattedDate();
+                }
+                await Utils.log("Configuration loaded:", this.config);
+            } catch (e) {
+                await Utils.error("Failed to load configuration:", e);
+                this.config = { ...this.defaultConfig };
+                this.config.targetDate = Utils.getTomorrowFormattedDate();
+            }
+        },
 
-        const availableFloors = Object.keys(config.seatPreferences);
-        availableFloors.forEach(floor => {
-            const option = document.createElement('option');
-            option.value = floor;
-            option.textContent = floor;
-            uiElements.floorSelect.appendChild(option);
-        });
+        async save() {
+            try {
+                // [核心修改] 将新的速度配置项加入保存列表，以便持久化
+                const configToSave = {
+                    autoStartAtSpecificTime: this.config.autoStartAtSpecificTime,
+                    startHour: this.config.startHour, startMinute: this.config.startMinute, startSecond: this.config.startSecond,
+                    targetDate: this.config.targetDate, targetStartTime: this.config.targetStartTime, targetEndTime: this.config.targetEndTime,
+                    uiSelectedFloor: this.config.uiSelectedFloor, uiSelectedPreference: this.config.uiSelectedPreference,
+                    uiPreferredSeatNumber: this.config.uiPreferredSeatNumber, uiPanelMinimized: this.config.uiPanelMinimized,
+                    autoConfirmReservation: this.config.autoConfirmReservation,
 
-        let currentDetectedFloor = vm ? await getFloorIdentifier(vm.readingRoom) : null; // await
-        if (config.uiSelectedFloor && (availableFloors.includes(config.uiSelectedFloor) || config.uiSelectedFloor === 'auto')) {
-            uiElements.floorSelect.value = config.uiSelectedFloor;
-        } else if (currentDetectedFloor && availableFloors.includes(currentDetectedFloor)) {
-            uiElements.floorSelect.value = currentDetectedFloor;
-            config.uiSelectedFloor = currentDetectedFloor;
-        } else {
-            if (availableFloors.includes("3F")) {
-                uiElements.floorSelect.value = "3F";
-                config.uiSelectedFloor = "3F";
-            } else {
-                uiElements.floorSelect.value = 'auto';
-                config.uiSelectedFloor = 'auto';
+                    // [新增] 保存速度设置
+                    refreshInterval: this.config.refreshInterval,
+                    postSelectionDelay: this.config.postSelectionDelay,
+                    postActionMaxWait: this.config.postActionMaxWait,
+                };
+                await GM_setValue(this.key, configToSave);
+                await Utils.log("Configuration saved.");
+            } catch (e) {
+                await Utils.error("Failed to save configuration:", e);
+            }
+        },
+        debouncedSave: Utils.debounce(() => ConfigManager.save(), 500),
+
+        get(key) { return this.config[key]; },
+        set(key, value, shouldSave = true) {
+            this.config[key] = value;
+            if (shouldSave) {
+                this.debouncedSave();
             }
         }
-        await saveConfig(); // await
+    };
 
-        const selectedFloorForPreferences = (uiElements.floorSelect.value === 'auto' && currentDetectedFloor) ? currentDetectedFloor : uiElements.floorSelect.value;
-        const currentFloorPreferences = config.seatPreferences[selectedFloorForPreferences] || [];
+    // =================================================================================
+    // --- [模块] Vue 适配器 (VueAdapter) ---
+    // =================================================================================
+    const VueAdapter = {
+        vm: null,
+        init(vueInstance) {
+            this.vm = vueInstance;
+        },
 
-        const autoPrefOption = document.createElement('option');
-        autoPrefOption.value = 'auto';
-        autoPrefOption.textContent = '按优先级选择（默认）';
-        uiElements.preferenceSelect.appendChild(autoPrefOption);
-
-        currentFloorPreferences.forEach(pref => {
-            const option = document.createElement('option');
-            option.value = pref.type;
-            option.textContent = pref.type;
-            uiElements.preferenceSelect.appendChild(option);
-        });
-
-        if (config.uiSelectedPreference && 
-            (uiElements.preferenceSelect.querySelector(`option[value="${config.uiSelectedPreference}"]`) || config.uiSelectedPreference === 'auto')) {
-            uiElements.preferenceSelect.value = config.uiSelectedPreference;
-        } else {
-            uiElements.preferenceSelect.value = 'auto';
-            config.uiSelectedPreference = 'auto';
-        }
-        await saveConfig(); // await
-    }
-
-    let nextAutoStartTime = null; // To store next scheduled time
-    let autoStartTimer = null; // For the scheduled timeout
-
-    function updateTimerDisplay() {
-        if (!uiReady || !uiElements.panel) {
-            // UI not ready or panel not found, cannot update display.
-            return;
-        }
-
-        const { startBtn, resetBtn, autoStartToggle, minimizedStartReserveBtn, minimizedShowTimeBtn, statusEl } = uiElements;
-
-        if (isReservationLoopActive) { // If actively trying to reserve
-            if (!config.uiPanelMinimized) {
-                startBtn.style.display = 'none';
-                resetBtn.style.display = 'inline-block';
+        _callVmMethod(methodNames, ...args) {
+            for (const name of methodNames) {
+                if (typeof this.vm[name] === 'function') {
+                    Utils.log(`Calling VM method: ${name}`);
+                    return this.vm[name](...args);
+                }
             }
-            if (minimizedStartReserveBtn) { // Ensure element exists before accessing
+            throw new Error(`No known VM method found from: [${methodNames.join(', ')}]`);
+        },
+
+        async getSeats() {
+            return this._callVmMethod(['getSeats', 'getSeatList', 'refreshSeats', 'loadSeats']);
+        },
+
+        async selectSeat(seat) {
+            if (typeof this.vm.selectSeat === 'function') {
+                return this.vm.selectSeat({ seat, index: this.vm.seatList.findIndex(s => s.id === seat.id) });
+            }
+            return this._callVmMethod(['handleSeatClick'], seat);
+        },
+
+        async confirmReservation(seat) {
+            return this._callVmMethod(['confirmReservation', 'submitReservation', 'reserveSeat'], seat);
+        },
+
+        async setTimeRange(date, startTime, endTime) {
+            if (!this.vm.timeRange) throw new Error('vm.timeRange is not available.');
+            this.vm.timeRange.date = date;
+            this.vm.timeRange.startTime = startTime;
+            this.vm.timeRange.endTime = endTime;
+            // Use $set for reactivity if available
+            if (typeof this.vm.$set === 'function') {
+                this.vm.$set(this.vm.timeRange, 'date', date);
+                this.vm.$set(this.vm.timeRange, 'startTime', startTime);
+                this.vm.$set(this.vm.timeRange, 'endTime', endTime);
+            }
+            await new Promise(r => setTimeout(r, ConfigManager.get('postActionMinDelay')));
+            await Utils.log('Time range updated in VM.');
+        }
+    };
+
+    // =================================================================================
+    // --- [模块] UI 管理器 (UIManager) --- [v1.5.7 超紧凑布局]
+    // =================================================================================
+    const UIManager = {
+        elements: {},
+        isReady: false,
+        quickTimeRanges: [
+            { name: "全天", start: "08:15", end: "21:45" },
+            { name: "上午", start: "08:15", end: "12:00" },
+            { name: "下午1", start: "12:20", end: "15:20" },
+            { name: "下午2", start: "15:00", end: "18:00" },
+            { name: "晚上", start: "18:00", end: "21:45" }
+        ],
+
+        create() {
+            if (document.getElementById('libseat-reservation-panel')) {
+                Utils.log('UI panel already exists. Re-initializing.');
+                this.initialize();
+                return;
+            }
+            const panel = document.createElement('div');
+            panel.id = 'libseat-reservation-panel';
+            // [核心修改] 将日期和时间段放在同一行
+            panel.innerHTML = `
+                <style>
+                    #libseat-reservation-panel{position:fixed;top:20px;right:20px;z-index:9999;background:white;padding:15px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.2);font-family:sans-serif;font-size:14px;color:#333;transition:all .3s ease;width:350px}
+                    #libseat-reservation-panel *{box-sizing:border-box}#libseat-reservation-panel .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:5px;border-bottom:1px solid #eee}
+                    #libseat-reservation-panel h3{margin:0;font-size:16px}#libseat-reservation-panel button{background:0;border:0;cursor:pointer;font-size:16px;color:#666}#libseat-reservation-panel button:hover{color:#000}
+                    #libseat-reservation-panel label{display:block;margin-bottom:5px;font-weight:700;color:#555}
+                    #libseat-reservation-panel select,#libseat-reservation-panel input{width:100%;padding:8px;margin-bottom:10px;border:1px solid #ddd;border-radius:4px;font-size:14px}
+                    #libseat-reservation-panel .input-group-row{display:flex;gap:8px;align-items:center}
+                    #libseat-reservation-panel .quick-time-ranges{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px}
+                    #libseat-reservation-panel .quick-time-btn{padding:5px 10px;font-size:12px;background:#f0f0f0;border:1px solid #ccc;border-radius:4px;color:#555}
+                    #libseat-reservation-panel .quick-time-btn:hover{background:#e0e0e0}
+                    #libseat-reservation-panel .action-btn{padding:10px;border:0;border-radius:4px;color:#fff;font-weight:700;cursor:pointer;font-size:15px;transition:background .2s}
+                    #libseat-reservation-panel #start-reserve-btn{background:#4CAF50}#libseat-reservation-panel #start-reserve-btn:hover{background:#43A047}
+                    #libseat-reservation-panel #reset-reserve-btn{background:#FF9800}#libseat-reservation-panel #reset-reserve-btn:hover{background:#FB8C00}
+                    #libseat-reservation-panel #refresh-seats-btn{background:#2196F3}#libseat-reservation-panel #refresh-seats-btn:hover{background:#1976D2}
+                    #libseat-reservation-panel #reservation-status{padding:10px;background:#f8f9fa;border-radius:4px;min-height:20px;color:#333;margin-top:15px;font-size:13px;text-align:center;border:1px solid #dee2e6;transition:all .3s}
+                    #libseat-reservation-panel #minimized-panel-content{display:none;flex-direction:column;gap:8px;margin-top:5px}
+                    #libseat-reservation-panel #minimized-panel-content button{background-color:#f8f8f8;border:1px solid #e0e0e0;padding:8px 10px;font-size:13px;border-radius:4px;width:100%;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+                    .settings-container{display:none;border-top:1px solid #eee;margin-top:10px;padding-top:10px}
+                    #toggle-all-settings{font-size:12px;color:#007bff;text-decoration:none;cursor:pointer;float:right;margin-top:-5px;margin-bottom:5px}
+                    .settings-header{font-weight:bold;margin-top:5px;margin-bottom:8px;font-size:13px;color:#333}
+                </style>
+                <div class="header"><h3>QIshan今天抢到座位了吗</h3><button id="minimize-panel">▴</button></div>
+                <div id="minimized-panel-content">
+                    <button id="minimized-start-reserve-btn" title="点击立即开始抢座">手动立刻抢座</button>
+                    <button id="minimized-show-time-btn" title="点击展开设置面板">预约时间: 就绪</button>
+                </div>
+                <div id="panel-content">
+                    <div class="input-group-row"><div style="flex:1"><label for="floor-select">楼层:</label><select id="floor-select"></select></div><div style="flex:1"><label for="preference-select">地段偏好:</label><select id="preference-select"></select></div></div>
+
+                    <!-- [布局优化] 日期和时间段放在同一行 -->
+                    <div class="input-group-row">
+                        <div style="flex: 1 1 40%;">
+                            <label for="res-date-input">预约日期:</label>
+                            <input type="date" id="res-date-input">
+                        </div>
+                        <div style="flex: 1 1 60%;">
+                            <label>时间段:</label>
+                            <div class="input-group-row">
+                                <input type="time" id="res-start-time" style="flex:1;">
+                                <span>-</span>
+                                <input type="time" id="res-end-time" style="flex:1;">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="quick-time-ranges">${this.quickTimeRanges.map(r=>`<button class="quick-time-btn" data-start="${r.start}" data-end="${r.end}">${r.name}</button>`).join('')}</div>
+
+                    <div><label for="preferred-seat-number">喜欢座位号:</label><input type="text" id="preferred-seat-number" placeholder="如: 40, 41 (逗号分隔)"></div>
+
+                    <a href="#" id="toggle-all-settings">展开设置...</a>
+
+                    <div id="all-settings-container" class="settings-container">
+                        <div class="settings-header">自动化设置</div>
+                        <div class="input-group-row" style="margin-bottom:10px;">
+                           <label style="margin-bottom:0;flex:1" for="auto-start-toggle"><input type="checkbox" id="auto-start-toggle" style="width:auto;margin-right:5px;">定时抢座</label>
+                           <label style="margin-bottom:0;flex:1" for="auto-confirm"><input type="checkbox" id="auto-confirm" style="width:auto;margin-right:5px;">自动确认</label>
+                        </div>
+                        <div id="auto-start-time-inputs" style="display:none;">
+                            <div class="input-group-row"><div style="flex:1"><label for="start-hour">时:</label><input type="number" id="start-hour" min="0" max="23"></div><div style="flex:1"><label for="start-minute">分:</label><input type="number" id="start-minute" min="0" max="59"></div><div style="flex:1"><label for="start-second">秒:</label><input type="number" id="start-second" min="0" max="59"></div></div>
+                        </div>
+
+                        <div class="settings-header">高级速度设置 (谨慎修改)</div>
+                        <div class="input-group-row">
+                            <div style="flex:1"><label for="rs-refresh-interval" title="每次刷新座位列表之间的等待时间。过低可能被服务器拒绝。">刷新(ms):</label><input type="number" id="rs-refresh-interval" min="100" step="100"></div>
+                            <div style="flex:1"><label for="rs-post-selection-delay" title="点击座位后，等待确认弹窗出现的延迟。">延迟(ms):</label><input type="number" id="rs-post-selection-delay" min="50" step="50"></div>
+                            <div style="flex:1"><label for="rs-outcome-timeout" title="点击确认后，等待成功/失败结果的最长时间。">超时(ms):</label><input type="number" id="rs-outcome-timeout" min="1000" step="500"></div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;gap:10px;margin-top:15px"><button id="start-reserve-btn" class="action-btn" style="flex:2">开始抢座</button><button id="refresh-seats-btn" class="action-btn" style="flex:1">刷新</button><button id="reset-reserve-btn" class="action-btn" style="flex:2;display:none">重置抢座</button></div>
+                    <div id="reservation-status">就绪，请设置参数并点击开始</div>
+                </div>
+            `;
+            document.body.appendChild(panel);
+            Utils.log('UI panel created and appended to body.');
+            this.initialize();
+        },
+
+        initialize() {
+            const ids = [
+                'libseat-reservation-panel', 'floor-select', 'preference-select',
+                'res-date-input', 'res-start-time', 'res-end-time', 'preferred-seat-number',
+                'auto-confirm', 'auto-start-toggle', 'start-hour', 'start-minute', 'start-second',
+                'start-reserve-btn', 'reset-reserve-btn', 'refresh-seats-btn', 'minimize-panel',
+                'minimized-start-reserve-btn', 'minimized-show-time-btn', 'panel-content',
+                'minimized-panel-content', 'reservation-status',
+                'rs-refresh-interval', 'rs-post-selection-delay', 'rs-outcome-timeout',
+                'toggle-all-settings', 'all-settings-container', 'auto-start-time-inputs'
+            ];
+
+            this.elements = ids.reduce((acc, id) => {
+                const camelCaseKey = id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
+                acc[camelCaseKey] = document.getElementById(id);
+                return acc;
+            }, {});
+
+            this.elements.statusEl = this.elements.reservationStatus; // Alias
+
+            this.applyConfigToUI();
+            if (!this.elements.libseatReservationPanel.dataset.listenersAdded) {
+                this.setupEventListeners();
+                this.elements.libseatReservationPanel.dataset.listenersAdded = 'true';
+            }
+            this.togglePanelVisibility(ConfigManager.get('uiPanelMinimized'), true);
+            this.isReady = true;
+        },
+
+        applyConfigToUI() {
+            this.elements.resDateInput.value = ConfigManager.get('targetDate');
+            this.elements.resStartTime.value = ConfigManager.get('targetStartTime');
+            this.elements.resEndTime.value = ConfigManager.get('targetEndTime');
+            this.elements.preferredSeatNumber.value = ConfigManager.get('uiPreferredSeatNumber');
+            this.elements.autoConfirm.checked = ConfigManager.get('autoConfirmReservation');
+            this.elements.autoStartToggle.checked = ConfigManager.get('autoStartAtSpecificTime');
+            this.elements.startHour.value = ConfigManager.get('startHour');
+            this.elements.startMinute.value = ConfigManager.get('startMinute');
+            this.elements.startSecond.value = ConfigManager.get('startSecond');
+            this.elements.rsRefreshInterval.value = ConfigManager.get('refreshInterval');
+            this.elements.rsPostSelectionDelay.value = ConfigManager.get('postSelectionDelay');
+            this.elements.rsOutcomeTimeout.value = ConfigManager.get('postActionMaxWait');
+
+            this.elements.autoStartTimeInputs.style.display = this.elements.autoStartToggle.checked ? 'block' : 'none';
+        },
+
+        setupEventListeners() {
+            this.elements.minimizePanel.addEventListener('click', () => this.togglePanelVisibility(!ConfigManager.get('uiPanelMinimized')));
+            this.elements.minimizedStartReserveBtn.addEventListener('click', () => ReservationEngine.manualStart());
+            this.elements.minimizedShowTimeBtn.addEventListener('click', () => this.togglePanelVisibility(false));
+            this.elements.startReserveBtn.addEventListener('click', () => ReservationEngine.manualStart());
+            this.elements.resetReserveBtn.addEventListener('click', () => ReservationEngine.stop());
+            this.elements.refreshSeatsBtn.addEventListener('click', () => ReservationEngine.manualRefresh());
+
+            const inputs = {
+                'res-date-input': 'targetDate', 'res-start-time': 'targetStartTime', 'res-end-time': 'targetEndTime',
+                'preferred-seat-number': 'uiPreferredSeatNumber', 'start-hour': 'startHour', 'start-minute': 'startMinute', 'start-second': 'startSecond'
+            };
+            for (const [id, key] of Object.entries(inputs)) {
+                document.getElementById(id).addEventListener('change', (e) => ConfigManager.set(key, e.target.value));
+            }
+
+            this.elements.toggleAllSettings.addEventListener('click', (e) => {
+                e.preventDefault();
+                const container = this.elements.allSettingsContainer;
+                const isVisible = container.style.display === 'block';
+                container.style.display = isVisible ? 'none' : 'block';
+                e.target.textContent = isVisible ? '展开设置...' : '收起设置';
+            });
+
+            this.elements.autoConfirm.addEventListener('change', (e) => ConfigManager.set('autoConfirmReservation', e.target.checked));
+
+            this.elements.autoStartToggle.addEventListener('change', (e) => {
+                ConfigManager.set('autoStartAtSpecificTime', e.target.checked);
+                this.elements.autoStartTimeInputs.style.display = e.target.checked ? 'block' : 'none';
+            });
+
+            const speedInputs = {
+                'rs-refresh-interval': 'refreshInterval',
+                'rs-post-selection-delay': 'postSelectionDelay',
+                'rs-outcome-timeout': 'postActionMaxWait'
+            };
+            for (const [id, key] of Object.entries(speedInputs)) {
+                document.getElementById(id).addEventListener('change', (e) => ConfigManager.set(key, parseInt(e.target.value, 10)));
+            }
+
+            this.elements.floorSelect.addEventListener('change', (e) => {
+                ConfigManager.set('uiSelectedFloor', e.target.value);
+                this.updateFloorAndPreferenceOptions();
+            });
+            this.elements.preferenceSelect.addEventListener('change', (e) => ConfigManager.set('uiSelectedPreference', e.target.value));
+
+            this.elements.panelContent.querySelector('.quick-time-ranges').addEventListener('click', (event) => {
+                const btn = event.target.closest('.quick-time-btn');
+                if (!btn) return;
+                this.elements.resStartTime.value = btn.dataset.start;
+                this.elements.resEndTime.value = btn.dataset.end;
+                ConfigManager.set('targetStartTime', btn.dataset.start, false);
+                ConfigManager.set('targetEndTime', btn.dataset.end);
+            });
+        },
+
+        togglePanelVisibility(isMinimized, skipSave = false) {
+            ConfigManager.set('uiPanelMinimized', isMinimized, !skipSave);
+            this.elements.panelContent.style.display = isMinimized ? 'none' : 'block';
+            this.elements.minimizedPanelContent.style.display = isMinimized ? 'flex' : 'none';
+            this.elements.minimizePanel.textContent = isMinimized ? '▾' : '▴';
+            this.elements.libseatReservationPanel.style.width = isMinimized ? '220px' : '350px';
+            this.updateTimerDisplay();
+        },
+
+        updateStatus(message, statusType = 'info') {
+            if (!this.isReady) {
+                Utils.log(`[Status Update] ${message}`);
+                return;
+            }
+            this.elements.statusEl.textContent = message;
+            const styles = {
+                info: { bg: '#f8f9fa', border: '#dee2e6', color: '#333' },
+                working: { bg: '#e3f2fd', border: '#2196F3', color: '#0d47a1' },
+                success: { bg: '#e8f5e9', border: '#4CAF50', color: '#1b5e20' },
+                error: { bg: '#ffebee', border: '#F44336', color: '#c62828' }
+            };
+            const style = styles[statusType] || styles.info;
+            this.elements.statusEl.style.backgroundColor = style.bg;
+            this.elements.statusEl.style.borderColor = style.border;
+            this.elements.statusEl.style.color = style.color;
+        },
+
+        async updateFloorAndPreferenceOptions() {
+            if (!this.isReady) return;
+            const floorSelect = this.elements.floorSelect;
+            const prefSelect = this.elements.preferenceSelect;
+            floorSelect.innerHTML = '<option value="auto">自动检测楼层</option>';
+            prefSelect.innerHTML = '<option value="auto">按优先级自动选择</option>';
+
+            Object.keys(ConfigManager.get('seatPreferences')).forEach(floor => {
+                floorSelect.add(new Option(floor, floor));
+            });
+            floorSelect.value = ConfigManager.get('uiSelectedFloor');
+
+            const selectedFloor = floorSelect.value === 'auto'
+                ? await ReservationEngine.getDetectedFloor()
+                : floorSelect.value;
+
+            if (selectedFloor && ConfigManager.get('seatPreferences')[selectedFloor]) {
+                ConfigManager.get('seatPreferences')[selectedFloor].forEach(pref => {
+                    prefSelect.add(new Option(pref.type, pref.type));
+                });
+            }
+            prefSelect.value = ConfigManager.get('uiSelectedPreference');
+        },
+
+        updateTimerDisplay() {
+            if (!this.isReady) return;
+            const { startReserveBtn, resetReserveBtn, minimizedStartReserveBtn, minimizedShowTimeBtn } = this.elements;
+            const isMinimized = ConfigManager.get('uiPanelMinimized');
+
+            if (ReservationEngine.isActive) {
+                startReserveBtn.style.display = 'none';
+                resetReserveBtn.style.display = isMinimized ? 'none' : 'inline-block';
                 minimizedStartReserveBtn.disabled = true;
                 minimizedStartReserveBtn.textContent = '抢座中...';
-            }
-            if (minimizedShowTimeBtn) { // Ensure element exists before accessing
-                minimizedShowTimeBtn.disabled = true;
-            }
-            if (!statusEl.textContent.startsWith('正在进行第') && !statusEl.textContent.includes('错误') && !statusEl.textContent.includes('停止')) {
-                statusEl.textContent = '正在抢座中...';
-            }
-        } else { // Not actively reserving
-            if (!config.uiPanelMinimized) {
-                startBtn.style.display = 'inline-block';
-                resetBtn.style.display = 'none';
-            }
-            if (minimizedStartReserveBtn) { // Ensure element exists before accessing
+            } else {
+                startReserveBtn.style.display = isMinimized ? 'none' : 'inline-block';
+                resetReserveBtn.style.display = 'none';
                 minimizedStartReserveBtn.disabled = false;
                 minimizedStartReserveBtn.textContent = '手动立刻抢座';
-            }
-            if (minimizedShowTimeBtn) { // Ensure element exists before accessing
-                minimizedShowTimeBtn.disabled = false;
-            }
 
-            if (autoStartToggle && autoStartToggle.checked && nextAutoStartTime) {
-                const now = new Date();
-                const diff = nextAutoStartTime.getTime() - now.getTime();
-                if (diff > 0) {
-                    const totalSeconds = Math.floor(diff / 1000);
-                    const hours = Math.floor(totalSeconds / 3600);
-                    const minutes = Math.floor((totalSeconds % 3600) / 60);
-                    const seconds = totalSeconds % 60;
-                    const timeString = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-                    statusEl.textContent = `将于 ${nextAutoStartTime.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} 自动抢座 (${timeString}后)`;
-                    if (minimizedShowTimeBtn) {
-                        minimizedShowTimeBtn.textContent = `下次自动: ${nextAutoStartTime.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`; // Show HH:MM
+                if (ConfigManager.get('autoStartAtSpecificTime') && ReservationEngine.nextAutoStartTime) {
+                    const diff = ReservationEngine.nextAutoStartTime.getTime() - Date.now();
+                    if (diff > 0) {
+                        const totalSeconds = Math.floor(diff / 1000);
+                        const h = String(Math.floor(totalSeconds / 3600)).padStart(2,'0');
+                        const m = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2,'0');
+                        const s = String(totalSeconds % 60).padStart(2,'0');
+                        minimizedShowTimeBtn.textContent = `下次自动: ${h}:${m}:${s}`;
                     }
                 } else {
-                    statusEl.textContent = '定时任务已过期或即将开始。';
-                    if (minimizedShowTimeBtn) {
-                        minimizedShowTimeBtn.textContent = '定时任务就绪';
-                    }
-                }
-            } else {
-                if (!statusEl.textContent.includes('错误') && !statusEl.textContent.includes('停止') && !statusEl.textContent.includes('成功')) {
-                    statusEl.textContent = '就绪，请设置参数并点击开始';
-                }
-                if (minimizedShowTimeBtn) {
                     minimizedShowTimeBtn.textContent = '预约时间: 就绪';
                 }
             }
         }
+    };
 
-        // Apply display changes for collapsed/expanded state
-        if (config.uiPanelMinimized) {
-            if (startBtn) startBtn.style.display = 'none';
-            if (resetBtn) resetBtn.style.display = 'none';
-        } else {
-            if (isReservationLoopActive) {
-                if (startBtn) startBtn.style.display = 'none';
-                if (resetBtn) resetBtn.style.display = 'inline-block';
-            } else {
-                if (startBtn) startBtn.style.display = 'inline-block';
-                if (resetBtn) resetBtn.style.display = 'none';
+    // =================================================================================
+    // --- [模块] 核心抢座引擎 (ReservationEngine) ---
+    // =================================================================================
+    const ReservationEngine = {
+        vm: null,
+        reservationTimer: null,
+        autoStartTimer: null,
+        nextAutoStartTime: null,
+        isActive: false,
+        attempts: 0,
+        MAX_ATTEMPTS: 5,
+        FETCH_SEAT_MAX_RETRIES: 3,
+        FETCH_SEAT_RETRY_DELAY: 1000,
+
+        async init(vueInstance) {
+            this.vm = vueInstance;
+            VueAdapter.init(vueInstance);
+            await UIManager.updateFloorAndPreferenceOptions();
+            this.scheduleAutoStart();
+        },
+
+        async getDetectedFloor() {
+            if (!this.vm || !this.vm.readingRoom) return null;
+            const path = this.vm.readingRoom.parentNamePath || this.vm.readingRoom.name || '';
+            const match = path.match(/(\d+F)/);
+            return match ? match[1] : null;
+        },
+
+        async scheduleAutoStart() {
+            if (this.autoStartTimer) clearTimeout(this.autoStartTimer);
+            this.nextAutoStartTime = null;
+
+            if (!ConfigManager.get('autoStartAtSpecificTime')) {
+                UIManager.updateStatus('定时抢座已关闭。');
+                return;
             }
-        }
-    }
 
-    async function scheduleAutoStart() {
-        if (autoStartTimer) {
-            clearTimeout(autoStartTimer);
-            autoStartTimer = null;
-        }
-        nextAutoStartTime = null; // Clear previous next auto start time
+            const now = new Date();
+            let targetTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), ConfigManager.get('startHour'), ConfigManager.get('startMinute'), ConfigManager.get('startSecond'));
+            if (targetTime <= now) targetTime.setDate(targetTime.getDate() + 1);
 
-        if (!uiReady || !uiElements.autoStartToggle || !uiElements.autoStartToggle.checked) {
-            updateUIStatus('定时抢座功能未启用或UI未就绪。');
-            updateTimerDisplay(); // Update display to reflect no scheduled task
+            const delay = targetTime.getTime() - now.getTime();
+            this.nextAutoStartTime = targetTime;
+            UIManager.updateStatus(`定时任务已设定，将于 ${targetTime.toLocaleString('zh-CN')} 自动抢座。`);
+            this.autoStartTimer = setTimeout(() => this.start(true), delay);
+            setInterval(() => UIManager.updateTimerDisplay(), 1000); // Update countdown
+        },
+
+        manualStart() {
+            this.stop(false); // Stop any existing timers but don't reset status message
+            this.start(true);
+        },
+
+        // [核心修改] 增加 reschedule 参数，用于控制是否重新安排下一次任务
+        stop(notify = true, reschedule = true) {
+            if (this.reservationTimer) clearTimeout(this.reservationTimer);
+            if (this.autoStartTimer) clearTimeout(this.autoStartTimer);
+            this.reservationTimer = null;
+            this.isActive = false;
+            if (notify) {
+                UIManager.updateStatus('抢座已停止。');
+            }
+            // 只有在需要的时候才重新安排任务
+            if (reschedule) {
+                this.scheduleAutoStart();
+            }
+            UIManager.updateTimerDisplay();
+        },
+
+
+    async start(isNewRun = false) {
+        if (isNewRun) this.attempts = 0;
+        this.isActive = true;
+        UIManager.updateTimerDisplay();
+
+        if (this.attempts >= this.MAX_ATTEMPTS) {
+            UIManager.updateStatus(`已达到最大抢座尝试次数 (${this.MAX_ATTEMPTS}次)，停止。`, 'error');
+            GM_notification({ title: GM.info.script.name, text: '抢座失败，已达到最大尝试次数。', timeout: 8000 });
+            this.stop(false, false); // [核心修改点] 彻底停止，不重新安排
+            return;
+        }
+        this.attempts++;
+        UIManager.updateStatus(`第 ${this.attempts}/${this.MAX_ATTEMPTS} 次尝试抢座...`, 'working');
+
+        if (!this.vm) {
+            UIManager.updateStatus('错误: Vue 实例丢失，无法继续。', 'error');
+            this.stop(true, false); // [核心修改点] 彻底停止
             return;
         }
 
-        const now = new Date();
-        const startHour = config.startHour;
-        const startMinute = config.startMinute;
-        const startSecond = config.startSecond;
-
-        // Calculate today's target time
-        let targetTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), startHour, startMinute, startSecond);
-
-        // If today's target time has already passed, schedule for tomorrow
-        if (targetTime.getTime() <= now.getTime()) {
-            targetTime.setDate(targetTime.getDate() + 1);
+        try {
+            await this.executeReservationFlow();
+        } catch (e) {
+            await Utils.error('Reservation flow caught an error:', e);
+            UIManager.updateStatus(`尝试失败: ${e.message}`, 'error');
+            this.scheduleNextAttempt();
         }
+    },
 
-        const delay = targetTime.getTime() - now.getTime();
 
-        if (delay > 0) {
-            nextAutoStartTime = targetTime;
-            updateUIStatus(`已设定定时任务，将于 ${targetTime.toLocaleString('zh-CN')} 自动启动抢座。`);
-            await log(`Scheduling auto-start in ${delay / 1000} seconds at ${targetTime.toLocaleString()}`);
-            
-            autoStartTimer = setTimeout(() => {
-                reservationAttempts = 0; // Reset attempts for timed start
-                reservationLoop();
-            }, delay);
-        } else {
-            updateUIStatus('定时任务时间设置有误，请检查。');
-            await error('Auto-start time is in the past or invalid, not scheduling.');
-        }
-        updateTimerDisplay(); // Update UI immediately after scheduling/descheduling
-    }
+        // [核心修改] 使用配置项替换硬编码的延迟
+        async executeReservationFlow() {
+            const { targetDate, targetStartTime, targetEndTime, uiSelectedFloor, uiPreferredSeatNumber } = ConfigManager.config;
+            UIManager.updateStatus(`第 ${this.attempts} 次尝试: 设置时间范围...`, 'working');
+            await VueAdapter.setTimeRange(targetDate, targetStartTime, targetEndTime);
 
-    // 包装UI创建，增加重试机制和稳定性检查
-    async function ensureUIPresentAndInitialized() {
-        let retries = 0;
-        const maxUIRetries = 10;
-        const retryDelay = 500; // ms
+            let sortedSeats = [];
+            const EMPTY_FETCH_RETRIES = 3;
+            // [修改点] 使用配置项代替固定的 1500
+            const refreshDelay = ConfigManager.get('refreshInterval');
 
-        while (retries < maxUIRetries && !uiReady) {
-            log(`尝试创建/初始化UI面板 (第 ${retries + 1}/${maxUIRetries} 次尝试)...`);
+            for (let i = 0; i < EMPTY_FETCH_RETRIES; i++) {
+                UIManager.updateStatus(`第 ${i + 1}/${EMPTY_FETCH_RETRIES} 次刷新座位列表...`, 'working');
+
+                const fetchSuccess = await this.ensureSeatListIsFetched();
+                if (!fetchSuccess) {
+                    throw new Error('获取座位列表失败，请检查网络。');
+                }
+
+                const preferredSeatNumbers = (uiPreferredSeatNumber || '').split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+                let floorForSorting = uiSelectedFloor === 'auto' ? await this.getDetectedFloor() : uiSelectedFloor;
+                if (!floorForSorting) {
+                    Utils.log("无法自动检测楼层, 使用默认 3F 进行排序。");
+                    floorForSorting = "3F";
+                }
+
+                const currentFoundSeats = this.filterAndSortSeats(this.vm.seatList, floorForSorting, preferredSeatNumbers);
+                UIManager.updateStatus(`当前可选座位: ${currentFoundSeats.length}`, 'info');
+
+                if (currentFoundSeats.length > 0) {
+                    sortedSeats = currentFoundSeats;
+                    break;
+                }
+
+                if (i < EMPTY_FETCH_RETRIES - 1) {
+                    await new Promise(r => setTimeout(r, refreshDelay));
+                }
+            }
+
+            if (sortedSeats.length === 0) {
+                UIManager.updateStatus('当前可选座位：0 请更换时间', 'error');
+                GM_notification({
+                    title: GM.info.script.name,
+                    text: '多次刷新后仍无空闲座位，抢座已停止。'
+                });
+                this.stop(false, false);
+                return;
+            }
+
+            UIManager.updateStatus(`锁定 ${sortedSeats.length} 个目标座位，尝试预约...`, 'working');
+
+            for (const seat of sortedSeats.slice(0, 3)) {
+                const success = await this.selectAndReserveSeat(seat);
+                if (success) {
+                    UIManager.updateStatus(`成功预约座位: ${seat.name}!`, 'success');
+                    Utils.log(`Successfully reserved seat: ${seat.name}`);
+                    GM_notification({ title: GM.info.script.name, text: `成功预约到座位: ${seat.name}！`, image: 'https://www.jlu.edu.cn/__local/A/24/7D/2920253818AFBB1F55C97500B6E_67995171_B10E6.jpg', timeout: 10000 });
+                    this.stop(false, true);
+                    return;
+                }
+                if (!this.isActive) return;
+            }
+
+            throw new Error('本轮所有候选座位均预约失败。');
+        },
+
+        // [核心修改] 使用配置项替换硬编码的延迟
+        async selectAndReserveSeat(seat) {
+            UIManager.updateStatus(`尝试预约座位 ${seat.name}...`, 'working');
             try {
-                createUI(); // 调用实际创建UI的函数
-                // 再次检查UI元素是否存在于DOM中，并确保uiReady标志被正确设置
-                if (document.getElementById('libseat-reservation-panel') && uiReady) {
-                    log('UI面板成功创建并初始化。');
+                await VueAdapter.selectSeat(seat);
+                // [修改点] 使用 postSelectionDelay 配置项代替固定的 300
+                await new Promise(r => setTimeout(r, ConfigManager.get('postActionMinDelay') + ConfigManager.get('postSelectionDelay')));
+
+                if (!this.vm.seatReserveVisible) {
+                    await Utils.error('Reservation modal did not appear.');
+                    return false;
+                }
+
+                if (!ConfigManager.get('autoConfirmReservation')) {
+                    UIManager.updateStatus('模态框已打开，请手动确认。');
+                    this.stop(false);
                     return true;
                 }
+
+                const initialUrl = window.location.href;
+                this.vm.reservationResult = null;
+
+                try {
+                    await VueAdapter.confirmReservation(seat);
+                } catch(e) {
+                    Utils.log('VM confirm method failed, falling back to DOM click. Error:', e.message);
+                    const confirmButton = document.querySelector('.seat-btn.seat-btn-primary, .btn-primary, button.primary');
+                    if (confirmButton) Utils.safeClick(confirmButton);
+                    else {
+                        await Utils.error('Could not find confirm button for DOM click fallback.');
+                        return false;
+                    }
+                }
+
+                const outcome = await this.checkReservationOutcome(initialUrl);
+                if (outcome.status === 'success') {
+                    return true;
+                } else {
+                    UIManager.updateStatus(`预约 ${seat.name} 失败: ${outcome.message}`, 'error');
+                    if (outcome.status === 'failure_existing_reservation') {
+                        UIManager.updateStatus(`预约失败: ${outcome.message} (已停止抢座)`, 'error');
+                        this.stop(false, false);
+                    }
+                    return false;
+                }
             } catch (e) {
-                error(`UI创建尝试中发生错误:`, e);
+                await Utils.error('Error during seat selection/confirmation:', e);
+                return false;
             }
-            retries++;
-            await new Promise(r => setTimeout(r, retryDelay));
-        }
-        if (!uiReady) {
-            error('多次尝试后仍无法创建UI面板。');
-            GM_notification({
-                title: GM.info.script.name,
-                text: 'UI面板无法显示，请检查控制台错误。',
-                image: 'https://www.jlu.edu.cn/__local/A/24/7D/2920253818AFBB1F55C97500B6E_67995171_B10E6.jpg', // JLU logo
-                timeout: 5000
+        },
+
+
+        async checkReservationOutcome(initialUrl) {
+            const MAX_WAIT = ConfigManager.get('postActionMaxWait');
+            let elapsedTime = 0;
+            return new Promise(resolve => {
+                const interval = setInterval(async () => {
+                    elapsedTime += 100;
+                    if (window.location.href !== initialUrl && window.location.href.includes('/pages/user/')) {
+                        clearInterval(interval);
+                        return resolve({ status: 'success', message: '页面已跳转至用户中心。' });
+                    }
+                    const errorMsg = document.querySelector('.uni-toast-content, .uni-modal-content, .error-message');
+                    if (errorMsg && errorMsg.offsetParent !== null) {
+                        const text = errorMsg.textContent.trim();
+                        if (text.includes('已有其他申请或预约')) {
+                            clearInterval(interval);
+                            return resolve({ status: 'failure_existing_reservation', message: text });
+                        } else if (text.includes('失败') || text.includes('不可预约') || text.includes('被占用')) {
+                            clearInterval(interval);
+                            return resolve({ status: 'failure', message: text });
+                        }
+                    }
+                    if (elapsedTime >= MAX_WAIT) {
+                        clearInterval(interval);
+                        return resolve({ status: 'timeout', message: '等待预约结果超时。' });
+                    }
+                }, 100);
             });
+        },
+
+        filterAndSortSeats(seatList, floorId, preferredSeatNumbers) {
+            const preferences = ConfigManager.get('seatPreferences')[floorId] || [];
+            const blacklist = ConfigManager.get('globalBlacklistKeywords');
+            const uiPref = UIManager.elements.preferenceSelect.value;
+            const prefDefs = new Map(preferences.map(p => [p.type, p]));
+
+            const validSeats = seatList.filter(seat =>
+                seat.type === 'SEAT' && seat.enabled && seat.status === 'FREE' &&
+                !blacklist.some(keyword => seat.name?.includes(keyword))
+            ).map(seat => {
+                const seatNumber = Utils.parseSeatNumberFromName(seat.name);
+                if (isNaN(seatNumber)) return null;
+
+                let category = "未分类", priority = Infinity;
+                if (uiPref === 'auto') {
+                    for (const pref of preferences.sort((a,b) => a.priority - b.priority)) {
+                        if (Utils.matchesPreferenceRule(pref.rule, seatNumber)) {
+                            category = pref.type;
+                            priority = pref.priority;
+                            break;
+                        }
+                    }
+                } else {
+                    const targetPref = prefDefs.get(uiPref);
+                    if (targetPref && Utils.matchesPreferenceRule(targetPref.rule, seatNumber)) {
+                        category = targetPref.type;
+                        priority = targetPref.priority;
+                    } else return null; // If user selects a specific type, filter out others
+                }
+
+                return { ...seat, seatNumber, category, priority,
+                    distance: Math.abs(seatNumber - Utils.DISTANCE_SORT_TARGET_SEAT),
+                    isPreferred: preferredSeatNumbers.includes(seatNumber)
+                };
+            }).filter(Boolean); // Remove nulls
+
+            return validSeats.sort((a, b) => {
+                if (a.isPreferred !== b.isPreferred) return a.isPreferred ? -1 : 1;
+                if (a.priority !== b.priority) return a.priority - b.priority;
+                return a.distance - b.distance;
+            });
+        },
+
+        // [核心修改] 替换旧的 fetchSeatListSafely 函数
+        async ensureSeatListIsFetched() {
+            for (let i = 0; i < this.FETCH_SEAT_MAX_RETRIES; i++) {
+                try {
+                    await VueAdapter.getSeats();
+                    await new Promise(r => setTimeout(r, 300));
+                    // 只要 seatList 存在 (即使是空数组)，就认为获取成功
+                    if (this.vm.seatList) {
+                        return true;
+                    }
+                    Utils.log(`Seat list is null or undefined. Retrying (${i + 1}/${this.FETCH_SEAT_MAX_RETRIES})...`);
+                } catch (e) {
+                    await Utils.error(`Error fetching seats (${i + 1}/${this.FETCH_SEAT_MAX_RETRIES}):`, e.message);
+                }
+                await new Promise(r => setTimeout(r, this.FETCH_SEAT_RETRY_DELAY));
+            }
+            return false; // 多次尝试后依然失败
+        },
+
+
+        scheduleNextAttempt() {
+            this.isActive = false;
+            if (this.reservationTimer) clearTimeout(this.reservationTimer);
+            const delay = ConfigManager.get('retryInterval') + (Math.random() * ConfigManager.get('randomizeDelay'));
+            UIManager.updateStatus(`等待 ${Math.round(delay / 1000)} 秒后重试...`);
+            this.reservationTimer = setTimeout(() => this.start(), delay);
+        },
+
+        // [核心修改] 替换旧的 manualRefresh 函数
+        async manualRefresh() {
+             if (!this.vm) {
+                UIManager.updateStatus('错误: 无法找到 Vue 实例。', 'error');
+                return;
+            }
+            UIManager.updateStatus('正在手动刷新座位列表...', 'working');
+            try {
+                await VueAdapter.setTimeRange(ConfigManager.get('targetDate'), ConfigManager.get('targetStartTime'), ConfigManager.get('targetEndTime'));
+
+                // 使用新的函数名，并检查其返回值
+                const fetchSuccess = await this.ensureSeatListIsFetched();
+
+                if (fetchSuccess) {
+                    const availableCount = this.vm.seatList.filter(s => s.type === 'SEAT' && s.enabled && s.status === 'FREE').length;
+                    UIManager.updateStatus(`座位刷新成功。当前可选座位: ${availableCount}`, 'success');
+                } else {
+                    UIManager.updateStatus('座位刷新失败，无法从服务器获取列表。', 'error');
+                }
+
+            } catch (e) {
+                await Utils.error('手动刷新座位失败:', e);
+                UIManager.updateStatus(`错误: 手动刷新座位失败。(${e.message})`, 'error');
+            }
         }
-        return uiReady;
-    }
 
+    };
 
-    // --- 主入口逻辑 ---
-    if (window.location.href.includes('libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2')) {
-        log('脚本正在目标页面运行。');
+    // =================================================================================
+    // --- [主入口] Main Execution ---
+    // =================================================================================
+    async function main() {
+        if (!window.location.href.includes('libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2')) {
+            Utils.log('Not on target page. Script will not run.');
+            return;
+        }
+
         GM_notification({
-            title: GM.info.script.name,
-            text: '脚本已启动，正在加载配置和UI...',
-            image: 'https://www.jlu.edu.cn/__local/A/24/7D/2920253818AFBB1F55C97500B6E_67995171_B10E6.jpg', // JLU logo
+            title: GM.info.script.name, text: '脚本已启动，正在初始化...',
+            image: 'https://www.jlu.edu.cn/__local/A/24/7D/2920253818AFBB1F55C97500B6E_67995171_B10E6.jpg',
             timeout: 3000
         });
 
-        (async () => {
-            await loadConfig();
-            
-            const uiLoaded = await ensureUIPresentAndInitialized();
+        await ConfigManager.load();
+        UIManager.create();
 
-            if (uiLoaded) {
-                updateUIStatus('UI已初始化。正在查找UniApp Vue实例...');
-                vm = await waitForUniAppPageVm();
-                if (vm) {
-                    updateUIStatus('UniApp Vue实例已找到。');
-                    await updateFloorAndPreferenceOptions(); // 确保这里是 await
-                    await scheduleAutoStart();
-                } else {
-                    updateUIStatus('错误: 无法找到 UniApp Vue 实例。抢座功能可能受限。请尝试刷新页面。');
-                    await error('多次尝试后未能找到 UniApp Vue 实例。');
-                }
-            } else {
-                 updateUIStatus('错误: UI面板无法正常加载。抢座功能可能受限。');
-                 await error('UI面板在多次尝试后加载失败。');
-            }
-        })();
-    } else {
-        log('脚本未在目标页面运行。当前URL:', window.location.href);
+        UIManager.updateStatus('正在查找 Vue 实例...', 'working');
+        const vueInstance = await Utils.waitForUniAppPageVm();
+
+        if (vueInstance) {
+            UIManager.updateStatus('Vue 实例已找到，脚本就绪。', 'success');
+            await ReservationEngine.init(vueInstance);
+        } else {
+            UIManager.updateStatus('错误: 无法找到 Vue 实例。请刷新页面重试。', 'error');
+        }
     }
-})();
-```
+
+    main().catch(e => Utils.error("An unhandled error occurred in main execution:", e));
+
+})();```
