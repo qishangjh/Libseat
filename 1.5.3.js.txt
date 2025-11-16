@@ -2,8 +2,8 @@
 // @name         QIshan今天抢到座位了吗 - V1.5.3
 // @namespace    https://github.com/qishangjh/Libseat
 // @version      1.5.3
-// @description  为吉林大学图书馆座位预约系统 (libseat.jlu.edu.cn) 创建的 Tampermonkey 用户脚本。经优化，结构更清晰，健壮性与用户体验更佳。
-// @author       QIshan (Optimized by Assistant)
+// @description  为吉林大学图书馆座位预约系统 (libseat.jlu.edu.cn) 创建的 Tampermonkey 用户脚本。
+// @author       QIshan
 // @match        https://libseat.jlu.edu.cn/pages/reserve/seat-reserve/seat-choose-v2*
 // @grant        GM_log
 // @grant        GM.info
